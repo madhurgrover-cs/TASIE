@@ -1,0 +1,29 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: push this repo to GitHub, then on Render: New + -> Blueprint -> pick the repo.
+services:
+  - type: web
+    name: sast-iq
+    runtime: docker
+    plan: free                 # free tier: no persistent disk (see note below)
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # PERSISTENCE (optional): the free plan has an ephemeral filesystem, so
+      # feedback labels and retrained models reset on every redeploy / spin-down.
+      # To keep them, switch `plan` above to `starter` (paid), then uncomment
+      # the `disk:` block and these two env vars.
+      # ─────────────────────────────────────────────────────────────────────
+      # - key: DATABASE_URL
+      #   value: sqlite:////data/sast_learning.db
+      # - key: MODEL_DIR
+      #   value: /data/models
+
+    # disk:
+    #   name: sast-data
+    #   mountPath: /data
+    #   sizeGB: 1
