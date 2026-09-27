@@ -21,7 +21,7 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
 # Retrieval baseline eval (writes appsretrieval_results.json, prints NDCG@10 / MRR@10)
 python -m retrieval.eval_baseline                                   # --preset coderankembed (default)
-python -m retrieval.eval_baseline --preset jina-code --out appsretrieval_results.jina-code.json
+python -m retrieval.eval_baseline --preset sfr-code-400m --out appsretrieval_results.sfr-code-400m.json
 python -m retrieval.eval_baseline --smoke 5 300                     # 5 queries / 300 docs → appsretrieval_results.smoke.json
 python -m retrieval.eval_baseline --query-max-len 128 --doc-max-len 512   # lengths are independent; --max-seq-length sets both (default 512)
 python -m retrieval.eval_baseline --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
@@ -77,7 +77,7 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   | Preset | Model | Params | Query prefix | Doc prefix | Pooling | License |
   |---|---|---|---|---|---|---|
   | `coderankembed` (default) | `nomic-ai/CodeRankEmbed` | 137M | `"Represent this query for searching relevant code: "` (card: "*must*") | none | CLS | MIT |
-  | `jina-code` | `jinaai/jina-embeddings-v2-base-code` | 161M | none | none | mean | Apache-2.0 |
+  | `jina-code` (**transformers<5 only**, exits on v5) | `jinaai/jina-embeddings-v2-base-code` | 161M | none | none | mean | Apache-2.0 |
   | `sfr-code-400m` | `Salesforce/SFR-Embedding-Code-400M_R` | 434M | none | none | CLS | **CC-BY-NC-4.0** |
 
   Pooling comes from the repo; the preset value is only checked and a mismatch is logged as a warning.
@@ -86,9 +86,23 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   `--query-prefix` / `--doc-prefix` override the preset.
 - Models are loaded in **fp32** (`model_kwargs={"torch_dtype": torch.float32}`). The jina and SFR
   checkpoints are stored in fp16/bf16, and transformers v5 would otherwise keep that dtype.
-- `nomic-ai/CodeRankEmbed` needs `einops`. sentence-transformers 6.1 requires transformers>=5, and
-  the jina (`jinaai/jina-bert-v2-qk-post-norm`) and SFR (`Alibaba-NLP/new-impl`) remote code hasn't
-  been verified on transformers v5 yet.
+- `nomic-ai/CodeRankEmbed` needs `einops`. sentence-transformers 6.1 requires transformers>=5.
+- **transformers v5 + remote code, uninitialised buffers.** v5 loads on the meta device and refills
+  every *non-persistent* buffer with `torch.empty_like`, trusting `_init_weights` to restore them.
+  The remote code for NomicBert (CodeRankEmbed: rotary `inv_freq`, attention `norm_factor`) and
+  Alibaba `new-impl` (SFR: `position_ids`, rotary `inv_freq`/`cos_cached`/`sin_cached`) computes
+  those buffers in `__init__` and never re-inits them, so after loading they hold garbage.
+  - SFR fails with a CUDA device-side assert (index out of bounds) during the first forward pass (see
+    HF discussion Alibaba-NLP/new-impl #14).
+  - CodeRankEmbed doesn't crash but silently gets garbage RoPE frequencies and attention scale.
+  - Fix: `restore_nonpersistent_buffers()` rebuilds the model from its config (weight init skipped
+    via `transformers.initialization.no_init_weights`) and copies the buffers over. It runs for every
+    model, logs `Restored N ... (M had uninitialised values)`, and records `buffers_restored` in the
+    results JSON.
+- **jina-code doesn't work on transformers v5.** Its remote code (`jinaai/jina-bert-v2-qk-post-norm`)
+  imports `find_pruneable_heads_and_indices` and calls `get_extended_attention_mask` /
+  `get_head_mask` / `invert_attention_mask`, all removed in v5. It would need transformers<5, which
+  conflicts with sentence-transformers 6.x, so the preset exits with a clear message.
 - Embeddings are L2-normalised, and similarity is cosine.
 - `--device auto|cuda|cpu` (default `auto` = CUDA if `torch.cuda.is_available()`). The resolved
   device is logged at startup and recorded in the results JSON. Screening is CPU, so use GPU for fast iteration only.
@@ -97,7 +111,8 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
 
 | Preset | q_len / d_len | NDCG@10 | MRR@10 | Notes |
 |---|---|---|---|---|
-| `coderankembed` | 512 / 512 | 0.2368 | 0.2066 | baseline; q_len 1024 gave no gain, so keep 512 |
+| `coderankembed` | 512 / 512 | 0.2368 | 0.2066 | **pre-fix (cache p1): suspect.** Likely ran with uninitialised `inv_freq`/`norm_factor`; q_len 1024 gave no gain |
+| `coderankembed` | 512 / 512 | — | — | rerun with the buffer fix (cache p2); `buffers_restored.differed > 0` confirms the old run was affected |
 
 ### Corpus embedding cache
 
@@ -106,7 +121,7 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   The hash is over the exact document texts (after the doc prefix) in the order mteb passes them, so a smoke subset, a
   different corpus, or another code version gets its own file automatically.
 - **Bump `PREPROC_VERSION`** whenever document-side preprocessing changes (prefixes, chunking,
-  normalisation). Query-side changes (prefix, `--query-max-len`) don't need a bump, since only docs are cached.
+  normalisation) or the encoder is fixed. It's `p2` since the buffer fix, so `p1` files are stale. Query-side changes (prefix, `--query-max-len`) don't need a bump, since only docs are cached.
 - The device is **not** part of the key. GPU and CPU embeddings differ only by float noise, but
   report official CPU numbers from a CPU-encoded corpus (use a separate `--cache-dir` or `--no-cache`).
 - `--no-cache` disables reading and writing. It's safe to delete the directory at any time.

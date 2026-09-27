@@ -15,6 +15,7 @@ task_metadata, hf_split, hf_subset, prompt_type, **encode_kwargs) -> Array.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -26,6 +27,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import transformers
 import mteb
 from mteb.models.abs_encoder import AbsEncoder
 from mteb.models.model_meta import ModelMeta, ScoringFunction
@@ -38,8 +40,10 @@ TASK_NAME = "AppsRetrieval"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
 
 # Bump whenever the text fed to the document encoder changes (prefixing,
-# truncation strategy, normalisation...) so stale cached embeddings are ignored.
-PREPROC_VERSION = "p1"
+# truncation strategy, normalisation...), or the encoder itself is fixed, so
+# stale cached embeddings are ignored.
+# p2: restore_nonpersistent_buffers(); p1 embeddings came from uninitialised buffers.
+PREPROC_VERSION = "p2"
 
 # Per-model settings, taken from each Hugging Face model card and the repo's
 # 1_Pooling/config.json (checked 2026-09-28). Pooling is loaded from the repo by
@@ -62,6 +66,11 @@ PRESETS: dict[str, dict[str, Any]] = {
         "doc_prefix": "",
         "pooling": "mean",
         "trust_remote_code": True,
+        # Its remote code (jinaai/jina-bert-v2-qk-post-norm) imports
+        # find_pruneable_heads_and_indices and calls get_extended_attention_mask /
+        # get_head_mask, all removed in transformers v5. Needs transformers<5,
+        # which conflicts with sentence-transformers 6.x.
+        "max_transformers_major": 4,
     },
     "sfr-code-400m": {
         "model": "Salesforce/SFR-Embedding-Code-400M_R",  # 434M, Alibaba "NewModel", CC-BY-NC-4.0
@@ -75,6 +84,49 @@ PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 DEFAULT_PRESET = "coderankembed"
+
+
+def restore_nonpersistent_buffers(st_model: SentenceTransformer) -> tuple[int, int]:
+    """Recompute non-persistent buffers that transformers v5 leaves uninitialised.
+
+    v5 builds the model on the meta device, refills every non-persistent buffer
+    with torch.empty_like, and relies on `_init_weights` to restore them. The
+    remote-code models here compute such buffers in __init__ (rotary inv_freq /
+    cos / sin caches, position_ids, attention norm_factor) and their
+    `_init_weights` never touches them, so they hold garbage after loading. SFR
+    then fails with a CUDA index-out-of-bounds assert (Alibaba-NLP/new-impl
+    discussion #14), and NomicBert silently gets wrong RoPE frequencies.
+
+    Fix: build a throwaway copy from the config (real construction, weight init
+    skipped) and copy its buffers over. Returns (restored, differed).
+    """
+    from transformers import PreTrainedModel
+
+    hf = next((m for m in st_model.modules() if isinstance(m, PreTrainedModel)), None)
+    if hf is None or not hasattr(hf, "named_non_persistent_buffers"):  # v4 never trashes them
+        return 0, 0
+    loaded = dict(hf.named_non_persistent_buffers())
+    if not loaded:
+        return 0, 0
+    try:
+        from transformers.initialization import no_init_weights
+    except ImportError:
+        no_init_weights = contextlib.nullcontext
+    with torch.device("cpu"), no_init_weights():
+        fresh = dict(type(hf)(hf.config).named_non_persistent_buffers())
+
+    restored = differed = 0
+    for name, buf in loaded.items():
+        new = fresh.get(name)
+        if new is None or new.shape != buf.shape:
+            logger.warning("Cannot restore buffer %s (missing or shape mismatch in fresh model)", name)
+            continue
+        new = new.to(device=buf.device, dtype=buf.dtype)
+        differed += not torch.equal(new, buf)
+        parent, _, attr = name.rpartition(".")
+        hf.get_submodule(parent).register_buffer(attr, new, persistent=False)
+        restored += 1
+    return restored, differed
 
 
 def _slug(s: str) -> str:
@@ -105,6 +157,10 @@ class CodeEncoder(AbsEncoder):
             trust_remote_code=trust_remote_code,
             model_kwargs={"torch_dtype": torch.float32},
         )
+        restored, differed = restore_nonpersistent_buffers(self.model)
+        logger.info("Restored %d non-persistent buffers (%d had uninitialised values after load)",
+                    restored, differed)
+        self.buffers_restored = {"restored": restored, "differed": differed}
         self.pooling = next((m.pooling_mode for m in self.model if hasattr(m, "pooling_mode")), None)
         logger.info("Loaded %s: pooling=%s, dim=%s", model_name, self.pooling,
                     self.model.get_sentence_embedding_dimension())
@@ -250,6 +306,10 @@ def main() -> None:
     logger.info("Device: %s (requested: %s)", device, args.device)
 
     preset_name, cfg = resolve_preset(args.preset, args.model)
+    max_major = cfg.get("max_transformers_major")
+    if max_major is not None and int(transformers.__version__.split(".")[0]) > max_major:
+        raise SystemExit(f"Preset {preset_name!r} needs transformers<{max_major + 1} "
+                         f"(installed {transformers.__version__}); see the note in PRESETS.")
     model_name = args.model or cfg["model"]
     query_prefix = cfg["query_prefix"] if args.query_prefix is None else args.query_prefix
     doc_prefix = cfg["doc_prefix"] if args.doc_prefix is None else args.doc_prefix
@@ -292,6 +352,8 @@ def main() -> None:
         "preset": preset_name,
         "model": model_name,
         "pooling": encoder.pooling,
+        "buffers_restored": encoder.buffers_restored,
+        "transformers_version": transformers.__version__,
         "query_max_len": encoder.query_max_len,
         "doc_max_len": encoder.doc_max_len,
         "query_prefix": encoder.query_prefix,
