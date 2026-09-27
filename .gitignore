@@ -43,3 +43,7 @@ desktop.ini
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Retrieval eval artefacts
+retrieval/cache/
+appsretrieval_results.smoke.json
