@@ -2,9 +2,9 @@
 Baseline dense-retrieval eval on MTEB "AppsRetrieval" (CoIR).
 Screening is CPU only; --device auto uses CUDA when available (e.g. Kaggle GPU).
 
-    python -m retrieval.eval_baseline                         # full eval, CodeRankEmbed
-    python -m retrieval.eval_baseline --model jinaai/jina-embeddings-v2-base-code
-    python -m retrieval.eval_baseline --smoke 5 300           # 5 queries, 300 docs
+    python -m retrieval.eval_baseline                         # full eval, preset coderankembed
+    python -m retrieval.eval_baseline --preset jina-code --out appsretrieval_results.jina-code.json
+    python -m retrieval.eval_baseline --preset sfr-code-400m --smoke 5 300
 
 Corpus embeddings are cached in --cache-dir (default retrieval/cache/, see CodeEncoder._cache_path),
 so query-side experiments don't re-encode the ~9k-doc corpus.
@@ -35,17 +35,46 @@ from sentence_transformers import SentenceTransformer
 logger = logging.getLogger("eval_baseline")
 
 TASK_NAME = "AppsRetrieval"
-DEFAULT_MODEL = "nomic-ai/CodeRankEmbed"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
 
 # Bump whenever the text fed to the document encoder changes (prefixing,
 # truncation strategy, normalisation...) so stale cached embeddings are ignored.
 PREPROC_VERSION = "p1"
 
-# Models that expect an instruction prefix on the query side only.
-QUERY_PREFIXES = {
-    "nomic-ai/CodeRankEmbed": "Represent this query for searching relevant code: ",
+# Per-model settings, taken from each Hugging Face model card and the repo's
+# 1_Pooling/config.json (checked 2026-09-28). Pooling is loaded from the repo by
+# sentence-transformers; it is listed here only to verify it at load time.
+# All three ship custom modelling code, so trust_remote_code is required.
+PRESETS: dict[str, dict[str, Any]] = {
+    "coderankembed": {
+        "model": "nomic-ai/CodeRankEmbed",  # 137M, NomicBert, MIT
+        # Card: the query "*must* include the following task instruction prefix";
+        # also the "query" prompt in config_sentence_transformers.json. Docs: none.
+        "query_prefix": "Represent this query for searching relevant code: ",
+        "doc_prefix": "",
+        "pooling": "cls",
+        "trust_remote_code": True,
+    },
+    "jina-code": {
+        "model": "jinaai/jina-embeddings-v2-base-code",  # 161M, JinaBert (ALiBi), Apache-2.0
+        # Card examples encode raw queries and raw code, no prefixes.
+        "query_prefix": "",
+        "doc_prefix": "",
+        "pooling": "mean",
+        "trust_remote_code": True,
+    },
+    "sfr-code-400m": {
+        "model": "Salesforce/SFR-Embedding-Code-400M_R",  # 434M, Alibaba "NewModel", CC-BY-NC-4.0
+        # Card examples (Transformers + ST) encode raw queries and raw code, no
+        # prefixes. The "Instruct: ...\nQuery: " template mteb uses is registered
+        # only for the 2B model, not this one.
+        "query_prefix": "",
+        "doc_prefix": "",
+        "pooling": "cls",
+        "trust_remote_code": True,
+    },
 }
+DEFAULT_PRESET = "coderankembed"
 
 
 def _slug(s: str) -> str:
@@ -60,15 +89,32 @@ class CodeEncoder(AbsEncoder):
         model_name: str,
         query_max_len: int = 512,
         doc_max_len: int = 512,
-        query_prefix: str | None = None,
+        query_prefix: str = "",
+        doc_prefix: str = "",
+        trust_remote_code: bool = True,
+        expected_pooling: str | None = None,
         cache_dir: Path | None = CACHE_DIR,
         device: str = "cpu",
     ):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device=device, trust_remote_code=True)
+        # fp32: jina/SFR checkpoints are stored in fp16/bf16, and transformers v5
+        # would otherwise load them in that dtype (slow and lossy on CPU).
+        self.model = SentenceTransformer(
+            model_name,
+            device=device,
+            trust_remote_code=trust_remote_code,
+            model_kwargs={"torch_dtype": torch.float32},
+        )
+        self.pooling = next((m.pooling_mode for m in self.model if hasattr(m, "pooling_mode")), None)
+        logger.info("Loaded %s: pooling=%s, dim=%s", model_name, self.pooling,
+                    self.model.get_sentence_embedding_dimension())
+        if expected_pooling and self.pooling != expected_pooling:
+            logger.warning("Pooling mismatch for %s: repo config gives %r, preset expects %r",
+                           model_name, self.pooling, expected_pooling)
         self.query_max_len = query_max_len
         self.doc_max_len = doc_max_len
-        self.query_prefix = QUERY_PREFIXES.get(model_name, "") if query_prefix is None else query_prefix
+        self.query_prefix = query_prefix
+        self.doc_prefix = doc_prefix
         self.cache_dir = cache_dir
         self.timings: dict[str, Any] = {
             "corpus_encode_s": 0.0,
@@ -88,8 +134,9 @@ class CodeEncoder(AbsEncoder):
         })
 
     def _cache_path(self, texts: list[str]) -> Path:
-        # Key = model + doc max length + preprocessing version + corpus content,
-        # so a different corpus (smoke subset, another code version) gets its own file.
+        # Key = model + doc max length + preprocessing version + corpus content
+        # (hashed after doc_prefix is applied), so a different corpus or doc prefix
+        # (smoke subset, another code version) gets its own file.
         h = hashlib.sha256()
         for t in texts:
             h.update(t.encode("utf-8", errors="ignore"))
@@ -121,6 +168,7 @@ class CodeEncoder(AbsEncoder):
             return emb
 
         t0 = time.perf_counter()
+        texts = [self.doc_prefix + t for t in texts]
         path = self._cache_path(texts) if self.cache_dir else None
         if path and path.exists():
             emb = np.load(path)
@@ -159,13 +207,31 @@ def subsample_task(task, n_queries: int, n_docs: int, seed: int = 0) -> None:
                         subset, split, len(data["queries"]), len(data["corpus"]), len(rel_docs))
 
 
+def resolve_preset(preset: str | None, model: str | None) -> tuple[str, dict[str, Any]]:
+    """--preset wins; else a --model matching a preset's model uses that preset;
+    else an unknown --model runs as "custom" with no prefixes."""
+    if preset:
+        return preset, PRESETS[preset]
+    if model is None:
+        return DEFAULT_PRESET, PRESETS[DEFAULT_PRESET]
+    for name, cfg in PRESETS.items():
+        if cfg["model"] == model:
+            return name, cfg
+    logger.warning("No preset for %s: using no prefixes, repo pooling, trust_remote_code=True", model)
+    return "custom", {"model": model, "query_prefix": "", "doc_prefix": "", "pooling": None,
+                      "trust_remote_code": True}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
+                    help=f"model + prefixes + pooling from PRESETS (default {DEFAULT_PRESET})")
+    ap.add_argument("--model", default=None, help="HF model id; picks the matching preset if there is one")
     ap.add_argument("--max-seq-length", type=int, default=512, help="default for both query and doc length")
     ap.add_argument("--query-max-len", type=int, default=None)
     ap.add_argument("--doc-max-len", type=int, default=None)
-    ap.add_argument("--query-prefix", default=None, help="override the per-model query prefix ('' to disable)")
+    ap.add_argument("--query-prefix", default=None, help="override the preset's query prefix ('' to disable)")
+    ap.add_argument("--doc-prefix", default=None, help="override the preset's doc prefix")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
                     help="auto = cuda if available, else cpu")
@@ -183,11 +249,21 @@ def main() -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("Device: %s (requested: %s)", device, args.device)
 
+    preset_name, cfg = resolve_preset(args.preset, args.model)
+    model_name = args.model or cfg["model"]
+    query_prefix = cfg["query_prefix"] if args.query_prefix is None else args.query_prefix
+    doc_prefix = cfg["doc_prefix"] if args.doc_prefix is None else args.doc_prefix
+    logger.info("Preset: %s | model=%s | query_prefix=%r | doc_prefix=%r",
+                preset_name, model_name, query_prefix, doc_prefix)
+
     encoder = CodeEncoder(
-        args.model,
+        model_name,
         query_max_len=args.query_max_len or args.max_seq_length,
         doc_max_len=args.doc_max_len or args.max_seq_length,
-        query_prefix=args.query_prefix,
+        query_prefix=query_prefix,
+        doc_prefix=doc_prefix,
+        trust_remote_code=cfg["trust_remote_code"],
+        expected_pooling=cfg["pooling"],
         cache_dir=None if args.no_cache else args.cache_dir,
         device=device,
     )
@@ -213,10 +289,13 @@ def main() -> None:
     out = Path(args.out or ("appsretrieval_results.smoke.json" if args.smoke else "appsretrieval_results.json"))
     payload = {
         "task": TASK_NAME,
-        "model": args.model,
+        "preset": preset_name,
+        "model": model_name,
+        "pooling": encoder.pooling,
         "query_max_len": encoder.query_max_len,
         "doc_max_len": encoder.doc_max_len,
         "query_prefix": encoder.query_prefix,
+        "doc_prefix": encoder.doc_prefix,
         "preproc_version": PREPROC_VERSION,
         "batch_size": args.batch_size,
         "device": device,
@@ -231,7 +310,7 @@ def main() -> None:
     out.write_text(json.dumps(payload, indent=2, default=str))
 
     t = encoder.timings
-    print(f"\n{TASK_NAME} | {args.model} | {device} | q_len={encoder.query_max_len} d_len={encoder.doc_max_len}")
+    print(f"\n{TASK_NAME} | {preset_name} ({model_name}) | {device} | q_len={encoder.query_max_len} d_len={encoder.doc_max_len}")
     print(f"  NDCG@10 = {ndcg10:.4f}")
     print(f"  MRR@10  = {mrr10:.4f}")
     print(f"  corpus encode {t['corpus_encode_s']:.1f}s (cache hits={t['corpus_cache_hits']}), "

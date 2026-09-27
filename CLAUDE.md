@@ -20,8 +20,8 @@ Nothing SAST-specific has been deleted yet. See the reuse table below before rem
 python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
 # Retrieval baseline eval (writes appsretrieval_results.json, prints NDCG@10 / MRR@10)
-python -m retrieval.eval_baseline                                   # nomic-ai/CodeRankEmbed
-python -m retrieval.eval_baseline --model jinaai/jina-embeddings-v2-base-code
+python -m retrieval.eval_baseline                                   # --preset coderankembed (default)
+python -m retrieval.eval_baseline --preset jina-code --out appsretrieval_results.jina-code.json
 python -m retrieval.eval_baseline --smoke 5 300                     # 5 queries / 300 docs → appsretrieval_results.smoke.json
 python -m retrieval.eval_baseline --query-max-len 128 --doc-max-len 512   # lengths are independent; --max-seq-length sets both (default 512)
 python -m retrieval.eval_baseline --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
@@ -70,18 +70,40 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   - `mteb.evaluate(model, task, encode_kwargs=..., cache=..., overwrite_strategy=...)`. By default it reads `~/.cache/mteb` with `"only-missing"` and would silently return old scores; the script passes `cache=None, overwrite_strategy="always"`.
   - `evaluate()` does not reload or unload a task whose data is already loaded, which is how `--smoke` subsets it.
   - Metric keys: `ndcg_at_10`, `mrr_at_10` in `results.task_results[0].scores["test"][0]`.
-- Default model `nomic-ai/CodeRankEmbed` (`trust_remote_code=True`, needs `einops`). Its query prefix
-  `"Represent this query for searching relevant code: "` is applied on the **query side only**
-  (`QUERY_PREFIXES`; override with `--query-prefix ''`).
+- **Presets** (`--preset`, `PRESETS` in the script). The settings come from each HF model card and the
+  repo's `1_Pooling/config.json`, not from memory. All three need `trust_remote_code=True`, and all are
+  <500M params so they can run on CPU:
+
+  | Preset | Model | Params | Query prefix | Doc prefix | Pooling | License |
+  |---|---|---|---|---|---|---|
+  | `coderankembed` (default) | `nomic-ai/CodeRankEmbed` | 137M | `"Represent this query for searching relevant code: "` (card: "*must*") | none | CLS | MIT |
+  | `jina-code` | `jinaai/jina-embeddings-v2-base-code` | 161M | none | none | mean | Apache-2.0 |
+  | `sfr-code-400m` | `Salesforce/SFR-Embedding-Code-400M_R` | 434M | none | none | CLS | **CC-BY-NC-4.0** |
+
+  Pooling comes from the repo; the preset value is only checked and a mismatch is logged as a warning.
+  SFR's "Instruct: ...\nQuery: " template in mteb is registered for the **2B** model only, so the 400M card uses raw text.
+  `--model <id>` alone selects the matching preset, and unknown ids run as `custom` with no prefixes.
+  `--query-prefix` / `--doc-prefix` override the preset.
+- Models are loaded in **fp32** (`model_kwargs={"torch_dtype": torch.float32}`). The jina and SFR
+  checkpoints are stored in fp16/bf16, and transformers v5 would otherwise keep that dtype.
+- `nomic-ai/CodeRankEmbed` needs `einops`. sentence-transformers 6.1 requires transformers>=5, and
+  the jina (`jinaai/jina-bert-v2-qk-post-norm`) and SFR (`Alibaba-NLP/new-impl`) remote code hasn't
+  been verified on transformers v5 yet.
 - Embeddings are L2-normalised, and similarity is cosine.
 - `--device auto|cuda|cpu` (default `auto` = CUDA if `torch.cuda.is_available()`). The resolved
   device is logged at startup and recorded in the results JSON. Screening is CPU, so use GPU for fast iteration only.
+
+### Results so far (full AppsRetrieval test split)
+
+| Preset | q_len / d_len | NDCG@10 | MRR@10 | Notes |
+|---|---|---|---|---|
+| `coderankembed` | 512 / 512 | 0.2368 | 0.2066 | baseline; q_len 1024 gave no gain, so keep 512 |
 
 ### Corpus embedding cache
 
 - `<cache-dir>/<model>__len<doc_max_len>__<PREPROC_VERSION>__n<N>_<sha256[:16]>.npy`
   (`--cache-dir`, default `retrieval/cache/`).
-  The hash is over the exact document texts in the order mteb passes them, so a smoke subset, a
+  The hash is over the exact document texts (after the doc prefix) in the order mteb passes them, so a smoke subset, a
   different corpus, or another code version gets its own file automatically.
 - **Bump `PREPROC_VERSION`** whenever document-side preprocessing changes (prefixes, chunking,
   normalisation). Query-side changes (prefix, `--query-max-len`) don't need a bump, since only docs are cached.
