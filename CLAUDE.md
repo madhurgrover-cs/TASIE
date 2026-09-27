@@ -24,6 +24,7 @@ python -m retrieval.eval_baseline                                   # nomic-ai/C
 python -m retrieval.eval_baseline --model jinaai/jina-embeddings-v2-base-code
 python -m retrieval.eval_baseline --smoke 5 300                     # 5 queries / 300 docs → appsretrieval_results.smoke.json
 python -m retrieval.eval_baseline --query-max-len 128 --doc-max-len 512   # lengths are independent; --max-seq-length sets both (default 512)
+python -m retrieval.eval_baseline --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
 ```
 
 Run Python from the **project root**, not from inside `.venv/.../site-packages/mteb`. mteb ships a
@@ -73,14 +74,19 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   `"Represent this query for searching relevant code: "` is applied on the **query side only**
   (`QUERY_PREFIXES`; override with `--query-prefix ''`).
 - Embeddings are L2-normalised, and similarity is cosine.
+- `--device auto|cuda|cpu` (default `auto` = CUDA if `torch.cuda.is_available()`). The resolved
+  device is logged at startup and recorded in the results JSON. Screening is CPU, so use GPU for fast iteration only.
 
 ### Corpus embedding cache
 
-- `retrieval/cache/<model>__len<doc_max_len>__<PREPROC_VERSION>__n<N>_<sha256[:16]>.npy`.
+- `<cache-dir>/<model>__len<doc_max_len>__<PREPROC_VERSION>__n<N>_<sha256[:16]>.npy`
+  (`--cache-dir`, default `retrieval/cache/`).
   The hash is over the exact document texts in the order mteb passes them, so a smoke subset, a
   different corpus, or another code version gets its own file automatically.
 - **Bump `PREPROC_VERSION`** whenever document-side preprocessing changes (prefixes, chunking,
   normalisation). Query-side changes (prefix, `--query-max-len`) don't need a bump, since only docs are cached.
+- The device is **not** part of the key. GPU and CPU embeddings differ only by float noise, but
+  report official CPU numbers from a CPU-encoded corpus (use a separate `--cache-dir` or `--no-cache`).
 - `--no-cache` disables reading and writing. It's safe to delete the directory at any time.
 
 ### Timing
@@ -93,10 +99,12 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
 
 ## Environment gotchas
 
-- **Windows Smart App Control / WDAC** on the dev machine blocks torch's unsigned DLLs
+- **All model/eval runs happen on Kaggle.** The dev laptop (4 GB RAM) is for editing only:
+  Windows Smart App Control blocks torch's unsigned DLLs there
   (`WinError 4551 ... Application Control policy has blocked this file`, surfacing as
-  `WinError 1114` on `c10.dll`). Torch can't load natively, so run the retrieval code in WSL (Ubuntu)
-  or Docker instead. The FastAPI/SAST parts don't need torch.
+  `WinError 1114` on `c10.dll`). Local checks are limited to `py_compile` and static review.
+  The FastAPI/SAST parts don't need torch.
+- **Branching:** work on `retrieval-baseline`; don't merge to `main` yet. Render auto-deploys `main`.
 - `requirements.txt` pins `torch==2.14.0`. On Linux (Docker/Render) plain `pip install` pulls the
   CUDA build (several GB). For CPU-only, install with
   `--extra-index-url https://download.pytorch.org/whl/cpu`.

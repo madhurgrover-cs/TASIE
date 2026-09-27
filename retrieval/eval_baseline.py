@@ -1,11 +1,12 @@
 """
-Baseline dense-retrieval eval on MTEB "AppsRetrieval" (CoIR), CPU only.
+Baseline dense-retrieval eval on MTEB "AppsRetrieval" (CoIR).
+Screening is CPU only; --device auto uses CUDA when available (e.g. Kaggle GPU).
 
     python -m retrieval.eval_baseline                         # full eval, CodeRankEmbed
     python -m retrieval.eval_baseline --model jinaai/jina-embeddings-v2-base-code
     python -m retrieval.eval_baseline --smoke 5 300           # 5 queries, 300 docs
 
-Corpus embeddings are cached in retrieval/cache/ (see CodeEncoder._cache_path),
+Corpus embeddings are cached in --cache-dir (default retrieval/cache/, see CodeEncoder._cache_path),
 so query-side experiments don't re-encode the ~9k-doc corpus.
 
 Written against mteb 2.21.8: AbsEncoder.encode(inputs: DataLoader[BatchedInput], *,
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 import mteb
 from mteb.models.abs_encoder import AbsEncoder
 from mteb.models.model_meta import ModelMeta, ScoringFunction
@@ -51,7 +53,7 @@ def _slug(s: str) -> str:
 
 
 class CodeEncoder(AbsEncoder):
-    """Wraps a sentence-transformers code embedding model for mteb, on CPU."""
+    """Wraps a sentence-transformers code embedding model for mteb."""
 
     def __init__(
         self,
@@ -60,9 +62,10 @@ class CodeEncoder(AbsEncoder):
         doc_max_len: int = 512,
         query_prefix: str | None = None,
         cache_dir: Path | None = CACHE_DIR,
+        device: str = "cpu",
     ):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device="cpu", trust_remote_code=True)
+        self.model = SentenceTransformer(model_name, device=device, trust_remote_code=True)
         self.query_max_len = query_max_len
         self.doc_max_len = doc_max_len
         self.query_prefix = QUERY_PREFIXES.get(model_name, "") if query_prefix is None else query_prefix
@@ -164,6 +167,9 @@ def main() -> None:
     ap.add_argument("--doc-max-len", type=int, default=None)
     ap.add_argument("--query-prefix", default=None, help="override the per-model query prefix ('' to disable)")
     ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
+                    help="auto = cuda if available, else cpu")
+    ap.add_argument("--cache-dir", type=Path, default=CACHE_DIR, help="corpus embedding cache directory")
     ap.add_argument("--no-cache", action="store_true", help="don't read/write corpus embedding cache")
     ap.add_argument("--smoke", nargs=2, type=int, metavar=("N_QUERIES", "N_DOCS"))
     ap.add_argument("--out", default=None, help="default: appsretrieval_results.json (.smoke.json with --smoke)")
@@ -172,12 +178,18 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     t_total = time.perf_counter()
 
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Device: %s (requested: %s)", device, args.device)
+
     encoder = CodeEncoder(
         args.model,
         query_max_len=args.query_max_len or args.max_seq_length,
         doc_max_len=args.doc_max_len or args.max_seq_length,
         query_prefix=args.query_prefix,
-        cache_dir=None if args.no_cache else CACHE_DIR,
+        cache_dir=None if args.no_cache else args.cache_dir,
+        device=device,
     )
 
     task = mteb.get_task(TASK_NAME)
@@ -207,6 +219,8 @@ def main() -> None:
         "query_prefix": encoder.query_prefix,
         "preproc_version": PREPROC_VERSION,
         "batch_size": args.batch_size,
+        "device": device,
+        "cache_dir": None if args.no_cache else str(args.cache_dir),
         "smoke": args.smoke,
         "mteb_version": mteb.__version__,
         "timings": {**encoder.timings, "total_s": total_s},
@@ -217,7 +231,7 @@ def main() -> None:
     out.write_text(json.dumps(payload, indent=2, default=str))
 
     t = encoder.timings
-    print(f"\n{TASK_NAME} | {args.model} | q_len={encoder.query_max_len} d_len={encoder.doc_max_len}")
+    print(f"\n{TASK_NAME} | {args.model} | {device} | q_len={encoder.query_max_len} d_len={encoder.doc_max_len}")
     print(f"  NDCG@10 = {ndcg10:.4f}")
     print(f"  MRR@10  = {mrr10:.4f}")
     print(f"  corpus encode {t['corpus_encode_s']:.1f}s (cache hits={t['corpus_cache_hits']}), "
