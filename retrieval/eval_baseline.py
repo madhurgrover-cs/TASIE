@@ -2,7 +2,8 @@
 Retrieval eval on MTEB "AppsRetrieval" (CoIR): dense, BM25 and hybrid (RRF), with
 optional query cleanup. Screening is CPU only; --device auto uses CUDA when available.
 
-    python retrieval/eval_baseline.py                                   # dense, raw queries
+    python retrieval/eval_baseline.py                                   # dense, desc-io queries
+    python retrieval/eval_baseline.py --model /kaggle/working/cre-ft    # finetune.py output (preset auto)
     python retrieval/eval_baseline.py --query-clean none desc desc-io   # ablation A
     python retrieval/eval_baseline.py --retriever dense bm25 hybrid     # ablation B
     python retrieval/eval_baseline.py --smoke 5 300 --retriever bm25
@@ -54,7 +55,12 @@ logger = logging.getLogger("eval_baseline")
 
 TASK_NAME = "AppsRetrieval"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
+# bm25 / hybrid are kept only for the ablation table: full-split NDCG@10 was
+# ~0.05 (bm25) and ~0.16 (hybrid) vs 0.2420 dense (2026-09-28).
 RETRIEVERS = ("dense", "bm25", "hybrid")
+# Ablation A winner (dense NDCG@10: none 0.2368, desc 0.1824, desc-io 0.2420).
+# finetune.py applies the same cleaning to training queries.
+DEFAULT_QUERY_CLEAN = "desc-io"
 
 # Bump whenever the text fed to the document encoder changes (prefixing,
 # truncation strategy, normalisation...), or the encoder itself is fixed, so
@@ -125,6 +131,47 @@ def restore_nonpersistent_buffers(st_model: SentenceTransformer) -> tuple[int, i
     return restored, differed
 
 
+def load_st_model(model_name: str, device: str, trust_remote_code: bool = True) -> tuple[SentenceTransformer, dict[str, int]]:
+    """Load in fp32 and repair non-persistent buffers. Shared by eval and finetune.py."""
+    # fp32: some checkpoints are stored in fp16/bf16, and transformers v5
+    # would otherwise load them in that dtype (slow and lossy on CPU).
+    model = SentenceTransformer(
+        model_name,
+        device=device,
+        trust_remote_code=trust_remote_code,
+        model_kwargs={"torch_dtype": torch.float32},
+    )
+    restored, differed = restore_nonpersistent_buffers(model)
+    logger.info("Restored %d non-persistent buffers (%d had uninitialised values after load)",
+                restored, differed)
+    return model, {"restored": restored, "differed": differed}
+
+
+# Written by finetune.py next to the saved model: base preset, run_id, val scores.
+FINETUNE_CONFIG = "finetune_config.json"
+
+
+def read_finetune_config(model_name: str) -> dict[str, Any] | None:
+    path = Path(model_name) / FINETUNE_CONFIG
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def model_fingerprint(model_name: str) -> str:
+    """Distinguishes different weights saved under the same local path (cache key).
+    Hub ids return "" (their name already identifies them)."""
+    path = Path(model_name)
+    if not path.is_dir():
+        return ""
+    ft = read_finetune_config(model_name)
+    if ft and ft.get("run_id"):
+        return ft["run_id"]
+    h = hashlib.sha256()
+    for f in sorted(p for p in path.rglob("*") if p.is_file()):
+        st = f.stat()
+        h.update(f"{f.relative_to(path)}:{st.st_size}:{st.st_mtime_ns}".encode())
+    return h.hexdigest()[:12]
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s)
 
@@ -145,18 +192,8 @@ class CodeEncoder(AbsEncoder):
         device: str = "cpu",
     ):
         self.model_name = model_name
-        # fp32: some checkpoints are stored in fp16/bf16, and transformers v5
-        # would otherwise load them in that dtype (slow and lossy on CPU).
-        self.model = SentenceTransformer(
-            model_name,
-            device=device,
-            trust_remote_code=trust_remote_code,
-            model_kwargs={"torch_dtype": torch.float32},
-        )
-        restored, differed = restore_nonpersistent_buffers(self.model)
-        logger.info("Restored %d non-persistent buffers (%d had uninitialised values after load)",
-                    restored, differed)
-        self.buffers_restored = {"restored": restored, "differed": differed}
+        self.fingerprint = model_fingerprint(model_name)
+        self.model, self.buffers_restored = load_st_model(model_name, device, trust_remote_code)
         self.pooling = next((m.pooling_mode for m in self.model if hasattr(m, "pooling_mode")), None)
         logger.info("Loaded %s: pooling=%s, dim=%s", model_name, self.pooling,
                     self.model.get_sentence_embedding_dimension())
@@ -198,7 +235,10 @@ class CodeEncoder(AbsEncoder):
         for t in texts:
             h.update(t.encode("utf-8", errors="ignore"))
             h.update(b"\0")
-        return f"{_slug(self.model_name)}__len{self.doc_max_len}__{PREPROC_VERSION}__n{len(texts)}_{h.hexdigest()[:16]}.npy"
+        # Local (fine-tuned) models add a fingerprint so retraining into the same
+        # --output-dir doesn't reuse stale embeddings.
+        model_tag = _slug(self.model_name) + (f"_{self.fingerprint}" if self.fingerprint else "")
+        return f"{model_tag}__len{self.doc_max_len}__{PREPROC_VERSION}__n{len(texts)}_{h.hexdigest()[:16]}.npy"
 
     def _encode_texts(self, texts: list[str], max_len: int, batch_size: int, show_progress: bool) -> np.ndarray:
         self.model.max_seq_length = max_len
@@ -283,7 +323,8 @@ def set_query_clean(task, original_queries: dict[tuple[str, str], Any], mode: st
 
 def resolve_preset(preset: str | None, model: str | None) -> tuple[str, dict[str, Any]]:
     """--preset wins; else a --model matching a preset's model uses that preset;
-    else an unknown --model runs as "custom" with no prefixes."""
+    else a local finetune.py output uses its base model's preset; else an unknown
+    --model runs as "custom" with no prefixes."""
     if preset:
         return preset, PRESETS[preset]
     if model is None:
@@ -291,6 +332,10 @@ def resolve_preset(preset: str | None, model: str | None) -> tuple[str, dict[str
     for name, cfg in PRESETS.items():
         if cfg["model"] == model:
             return name, cfg
+    ft = read_finetune_config(model)
+    if ft and ft.get("base_preset") in PRESETS:
+        logger.info("%s is fine-tuned from %s: using preset %s", model, ft["base_model"], ft["base_preset"])
+        return ft["base_preset"], PRESETS[ft["base_preset"]]
     logger.warning("No preset for %s: using no prefixes, repo pooling, trust_remote_code=True", model)
     return "custom", {"model": model, "query_prefix": "", "doc_prefix": "", "pooling": None,
                       "trust_remote_code": True}
@@ -304,9 +349,9 @@ def main() -> None:
     ap.add_argument("--retriever", nargs="+", choices=RETRIEVERS, default=["dense"],
                     help="dense = embedding model, bm25 = rank_bm25 over code tokens, "
                          "hybrid = RRF of the two (mteb.HybridSearch)")
-    ap.add_argument("--query-clean", nargs="+", choices=QUERY_CLEAN_MODES, default=["none"],
+    ap.add_argument("--query-clean", nargs="+", choices=QUERY_CLEAN_MODES, default=[DEFAULT_QUERY_CLEAN],
                     help="none = raw statement, desc = description only, "
-                         "desc-io = description + Input/Output spec (see query_clean.py)")
+                         f"desc-io = description + Input/Output spec (see query_clean.py). Default {DEFAULT_QUERY_CLEAN}")
     ap.add_argument("--rrf-k", type=int, default=60, help="RRF rank constant for --retriever hybrid")
     ap.add_argument("--bm25-weight", type=float, default=1.0,
                     help="RRF weight of BM25 relative to dense (dense weight is 1.0)")
@@ -422,6 +467,8 @@ def main() -> None:
         "task": TASK_NAME,
         "preset": preset_name,
         "model": model_name,
+        "model_fingerprint": model_fingerprint(model_name),
+        "finetune": read_finetune_config(model_name),
         "pooling": encoder.pooling if encoder else None,
         "buffers_restored": encoder.buffers_restored if encoder else None,
         "transformers_version": transformers.__version__,

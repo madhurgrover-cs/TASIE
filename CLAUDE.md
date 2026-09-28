@@ -21,12 +21,18 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
 # Retrieval eval (writes appsretrieval_results.json + appsretrieval_results_mteb/<variant>.json,
 # prints a summary table: variant, NDCG@10, MRR@10, time). `python -m retrieval.eval_baseline` also works.
-python retrieval/eval_baseline.py                                        # dense CodeRankEmbed, raw queries
+python retrieval/eval_baseline.py                                        # dense CodeRankEmbed, desc-io queries (default)
+python retrieval/eval_baseline.py --model /kaggle/working/cre-ft         # fine-tuned dir: coderankembed preset applied automatically
 python retrieval/eval_baseline.py --query-clean none desc desc-io        # ablation A (query cleanup)
 python retrieval/eval_baseline.py --retriever dense bm25 hybrid          # ablation B (BM25 + RRF hybrid)
 python retrieval/eval_baseline.py --smoke 5 300                          # 5 queries / 300 docs → appsretrieval_results.smoke.json
 python retrieval/eval_baseline.py --query-max-len 128 --doc-max-len 512  # lengths are independent; --max-seq-length sets both (default 512)
 python retrieval/eval_baseline.py --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
+
+# Fine-tune CodeRankEmbed on the APPS train split (GPU; writes model + finetune_config.json)
+python retrieval/finetune.py --output-dir /kaggle/working/cre-ft                      # CachedMNRL, 2 epochs, best val MRR@10 kept
+python retrieval/finetune.py --output-dir /kaggle/working/cre-ft-hn --hard-negatives 1  # + negatives mined with the base model
+python retrieval/finetune.py --output-dir /kaggle/working/cre-ft-smoke --smoke        # tiny run to check the pipeline
 ```
 
 Run Python from the **project root**, not from inside `.venv/.../site-packages/mteb`. mteb ships a
@@ -50,6 +56,7 @@ retrieval/
   eval_baseline.py      mteb AbsEncoder wrapper + AppsRetrieval eval (variant grid, summary table)
   bm25_search.py        code tokenizer + rank_bm25 as an mteb SearchProtocol model (no torch/mteb at import)
   query_clean.py        APPS problem-statement cleanup for --query-clean (pure Python)
+  finetune.py           CodeRankEmbed fine-tuning on APPS train (CachedMNRL, optional hard negatives)
   cache/                corpus embedding cache (gitignored)
 seed_training_data.py   seeds SAST feedback rows                            [SAST — replace]
 Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
@@ -117,6 +124,10 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
 | `coderankembed` | 512 / 512 | **0.2368** | **0.2073** | **baseline**, with the buffer fix (cache p2), Kaggle-confirmed |
 | `sfr-code-400m` | 512 / 512 | 0.0 | — | still 0.0 after the fix → preset removed |
 
+Ablations (CodeRankEmbed 512/512, full split, 2026-09-28): dense/none **0.2368**, dense/desc-io **0.2420** (best →
+default `--query-clean`), dense/desc 0.1824, bm25 ~0.05, hybrid RRF ~0.16 (hurts). The BM25/hybrid code stays only
+to reproduce the ablation table.
+
 ### Ablations: query cleanup (A) and BM25 hybrid (B)
 
 - `--query-clean` and `--retriever` take several values, and every combination runs as a variant
@@ -176,3 +187,29 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   CUDA build (several GB). For CPU-only, install with
   `--extra-index-url https://download.pytorch.org/whl/cpu`.
 - `pydantic==2.5.2` works with mteb but prints a "protected namespace model_" warning, which is harmless.
+
+## Fine-tuning: `retrieval/finetune.py`
+
+- **No test data:** only the `default` config's **train** qrels are loaded (dataset path and revision come
+  from mteb's AppsRetrieval metadata). Test queries and qrels are never read. A train-qrel query with
+  `partition != "train"` aborts the run.
+- **Validation:** `--val-size` (500) train queries are held out with a seeded shuffle. The val corpus is every
+  train-qrel doc, so held-out positives compete with the training docs, as they do in the AppsRetrieval corpus.
+  `--val-max-docs` caps the corpus (used by `--smoke`).
+- **Same text as eval:** the preset query prefix, `--query-clean` (default desc-io) and mteb's title + text doc join.
+- **Training** (ST 6.1 API checked in source: `sentence_transformers.sentence_transformer.losses`, `.evaluation`,
+  `base.sampler.BatchSamplers`):
+  - `CachedMultipleNegativesRankingLoss` with `--batch-size` 128 in-batch negatives and `--mini-batch-size` 16 GradCache chunks.
+  - `NO_DUPLICATES` sampler, fp16 on CUDA, lr 2e-5, 10% warmup, 2 epochs, max len 512.
+  - `report_to="none"`, since Kaggle's wandb would prompt for a login. `save_strategy="no"`: the best epoch is kept on CPU instead.
+  - `CUDA_VISIBLE_DEVICES` defaults to `0`, because 2×T4 would trigger DataParallel.
+- **Per-epoch log:** `InformationRetrievalEvaluator` runs before training (epoch 0 = base) and after every epoch.
+  Val MRR@10 / NDCG@10 and epoch train time are logged. `--select best` (default) saves the best-val-MRR epoch,
+  and if no epoch beats the base it warns and saves the final one.
+- **`--hard-negatives N`** (default 0 = off): `mine_hard_negatives` with the **base** model before training
+  (relative_margin 0.05, top-N, `n-tuple`). Candidates exclude val docs. Pairs without a valid negative are dropped,
+  and the row counts are logged.
+- **Output:** `--output-dir` gets `model.save()` plus `finetune_config.json` (base preset, `run_id`, history,
+  timings). `eval_baseline.py --model <dir>` reads `base_preset` to apply the prefixes. The corpus cache key
+  includes `run_id` (or a file-stat hash for other local dirs), so retraining into the same dir never reuses
+  stale embeddings.
