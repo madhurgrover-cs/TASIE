@@ -47,3 +47,4 @@ htmlcov/
 # Retrieval eval artefacts
 retrieval/cache/
 appsretrieval_results.smoke.json
+appsretrieval_results*_mteb/

@@ -1,26 +1,37 @@
 """
-Baseline dense-retrieval eval on MTEB "AppsRetrieval" (CoIR).
-Screening is CPU only; --device auto uses CUDA when available (e.g. Kaggle GPU).
+Retrieval eval on MTEB "AppsRetrieval" (CoIR): dense, BM25 and hybrid (RRF), with
+optional query cleanup. Screening is CPU only; --device auto uses CUDA when available.
 
-    python -m retrieval.eval_baseline                         # full eval, preset coderankembed
-    python -m retrieval.eval_baseline --preset jina-code --out appsretrieval_results.jina-code.json
-    python -m retrieval.eval_baseline --preset sfr-code-400m --smoke 5 300
+    python retrieval/eval_baseline.py                                   # dense, raw queries
+    python retrieval/eval_baseline.py --query-clean none desc desc-io   # ablation A
+    python retrieval/eval_baseline.py --retriever dense bm25 hybrid     # ablation B
+    python retrieval/eval_baseline.py --smoke 5 300 --retriever bm25
 
-Corpus embeddings are cached in --cache-dir (default retrieval/cache/, see CodeEncoder._cache_path),
-so query-side experiments don't re-encode the ~9k-doc corpus.
+--query-clean and --retriever each take several values. Every combination runs
+as one variant (the model is loaded once), and a summary table is printed at the
+end. Each variant goes through mteb.evaluate(), and its official TaskResult JSON
+is written to <out stem>_mteb/<variant>.json.
+
+Corpus embeddings are cached in --cache-dir (default retrieval/cache/, see
+CodeEncoder._cache_key) and in memory across variants, so query-side experiments
+don't re-encode the ~9k-doc corpus.
 
 Written against mteb 2.21.8: AbsEncoder.encode(inputs: DataLoader[BatchedInput], *,
-task_metadata, hf_split, hf_subset, prompt_type, **encode_kwargs) -> Array.
+task_metadata, hf_split, hf_subset, prompt_type, **encode_kwargs) -> Array. BM25
+is a SearchProtocol model (bm25_search.py), and the hybrid is mteb.HybridSearch
+(models/hybrid_wrappers.py) with RRF.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import hashlib
+import itertools
 import json
 import logging
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -34,10 +45,16 @@ from mteb.models.model_meta import ModelMeta, ScoringFunction
 from mteb.types import PromptType
 from sentence_transformers import SentenceTransformer
 
+if __package__ in (None, ""):  # run as `python retrieval/eval_baseline.py`
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from retrieval.bm25_search import BM25CodeSearch
+from retrieval.query_clean import QUERY_CLEAN_MODES, clean_query
+
 logger = logging.getLogger("eval_baseline")
 
 TASK_NAME = "AppsRetrieval"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
+RETRIEVERS = ("dense", "bm25", "hybrid")
 
 # Bump whenever the text fed to the document encoder changes (prefixing,
 # truncation strategy, normalisation...), or the encoder itself is fixed, so
@@ -45,39 +62,18 @@ CACHE_DIR = Path(__file__).resolve().parent / "cache"
 # p2: restore_nonpersistent_buffers(); p1 embeddings came from uninitialised buffers.
 PREPROC_VERSION = "p2"
 
-# Per-model settings, taken from each Hugging Face model card and the repo's
+# Per-model settings, taken from the Hugging Face model card and the repo's
 # 1_Pooling/config.json (checked 2026-09-28). Pooling is loaded from the repo by
 # sentence-transformers; it is listed here only to verify it at load time.
-# All three ship custom modelling code, so trust_remote_code is required.
+# Dropped 2026-09-28: jinaai/jina-embeddings-v2-base-code (its remote code needs
+# transformers<5) and Salesforce/SFR-Embedding-Code-400M_R (NDCG@10 0.0 even
+# after restore_nonpersistent_buffers()).
 PRESETS: dict[str, dict[str, Any]] = {
     "coderankembed": {
         "model": "nomic-ai/CodeRankEmbed",  # 137M, NomicBert, MIT
         # Card: the query "*must* include the following task instruction prefix";
         # also the "query" prompt in config_sentence_transformers.json. Docs: none.
         "query_prefix": "Represent this query for searching relevant code: ",
-        "doc_prefix": "",
-        "pooling": "cls",
-        "trust_remote_code": True,
-    },
-    "jina-code": {
-        "model": "jinaai/jina-embeddings-v2-base-code",  # 161M, JinaBert (ALiBi), Apache-2.0
-        # Card examples encode raw queries and raw code, no prefixes.
-        "query_prefix": "",
-        "doc_prefix": "",
-        "pooling": "mean",
-        "trust_remote_code": True,
-        # Its remote code (jinaai/jina-bert-v2-qk-post-norm) imports
-        # find_pruneable_heads_and_indices and calls get_extended_attention_mask /
-        # get_head_mask, all removed in transformers v5. Needs transformers<5,
-        # which conflicts with sentence-transformers 6.x.
-        "max_transformers_major": 4,
-    },
-    "sfr-code-400m": {
-        "model": "Salesforce/SFR-Embedding-Code-400M_R",  # 434M, Alibaba "NewModel", CC-BY-NC-4.0
-        # Card examples (Transformers + ST) encode raw queries and raw code, no
-        # prefixes. The "Instruct: ...\nQuery: " template mteb uses is registered
-        # only for the 2B model, not this one.
-        "query_prefix": "",
         "doc_prefix": "",
         "pooling": "cls",
         "trust_remote_code": True,
@@ -90,12 +86,12 @@ def restore_nonpersistent_buffers(st_model: SentenceTransformer) -> tuple[int, i
     """Recompute non-persistent buffers that transformers v5 leaves uninitialised.
 
     v5 builds the model on the meta device, refills every non-persistent buffer
-    with torch.empty_like, and relies on `_init_weights` to restore them. The
-    remote-code models here compute such buffers in __init__ (rotary inv_freq /
-    cos / sin caches, position_ids, attention norm_factor) and their
-    `_init_weights` never touches them, so they hold garbage after loading. SFR
-    then fails with a CUDA index-out-of-bounds assert (Alibaba-NLP/new-impl
-    discussion #14), and NomicBert silently gets wrong RoPE frequencies.
+    with torch.empty_like, and relies on `_init_weights` to restore them. Remote-code
+    models compute such buffers in __init__ (rotary inv_freq / cos / sin caches,
+    position_ids, attention norm_factor), and their `_init_weights` never touches
+    them, so they hold garbage after loading. NomicBert (CodeRankEmbed) then
+    silently gets wrong RoPE frequencies, and Alibaba new-impl models fail with a
+    CUDA index-out-of-bounds assert (Alibaba-NLP/new-impl discussion #14).
 
     Fix: build a throwaway copy from the config (real construction, weight init
     skipped) and copy its buffers over. Returns (restored, differed).
@@ -149,7 +145,7 @@ class CodeEncoder(AbsEncoder):
         device: str = "cpu",
     ):
         self.model_name = model_name
-        # fp32: jina/SFR checkpoints are stored in fp16/bf16, and transformers v5
+        # fp32: some checkpoints are stored in fp16/bf16, and transformers v5
         # would otherwise load them in that dtype (slow and lossy on CPU).
         self.model = SentenceTransformer(
             model_name,
@@ -172,12 +168,9 @@ class CodeEncoder(AbsEncoder):
         self.query_prefix = query_prefix
         self.doc_prefix = doc_prefix
         self.cache_dir = cache_dir
-        self.timings: dict[str, Any] = {
-            "corpus_encode_s": 0.0,
-            "query_encode_s": 0.0,
-            "corpus_cache_hits": 0,
-            "corpus_cache_misses": 0,
-        }
+        self._corpus_memo: dict[str, np.ndarray] = {}  # reused across variants in one run
+        self.timings: dict[str, Any] = {}
+        self.reset_timings()
         self.mteb_model_meta = ModelMeta.create_empty(overwrites={
             "name": model_name,
             "embed_dim": self.model.get_sentence_embedding_dimension(),
@@ -189,7 +182,15 @@ class CodeEncoder(AbsEncoder):
             "modalities": ["text"],
         })
 
-    def _cache_path(self, texts: list[str]) -> Path:
+    def reset_timings(self) -> None:
+        self.timings = {
+            "corpus_encode_s": 0.0,
+            "query_encode_s": 0.0,
+            "corpus_cache_hits": 0,
+            "corpus_cache_misses": 0,
+        }
+
+    def _cache_key(self, texts: list[str]) -> str:
         # Key = model + doc max length + preprocessing version + corpus content
         # (hashed after doc_prefix is applied), so a different corpus or doc prefix
         # (smoke subset, another code version) gets its own file.
@@ -197,8 +198,7 @@ class CodeEncoder(AbsEncoder):
         for t in texts:
             h.update(t.encode("utf-8", errors="ignore"))
             h.update(b"\0")
-        name = f"{_slug(self.model_name)}__len{self.doc_max_len}__{PREPROC_VERSION}__n{len(texts)}_{h.hexdigest()[:16]}.npy"
-        return self.cache_dir / name
+        return f"{_slug(self.model_name)}__len{self.doc_max_len}__{PREPROC_VERSION}__n{len(texts)}_{h.hexdigest()[:16]}.npy"
 
     def _encode_texts(self, texts: list[str], max_len: int, batch_size: int, show_progress: bool) -> np.ndarray:
         self.model.max_seq_length = max_len
@@ -225,8 +225,13 @@ class CodeEncoder(AbsEncoder):
 
         t0 = time.perf_counter()
         texts = [self.doc_prefix + t for t in texts]
-        path = self._cache_path(texts) if self.cache_dir else None
-        if path and path.exists():
+        key = self._cache_key(texts)
+        path = self.cache_dir / key if self.cache_dir else None
+        if key in self._corpus_memo:
+            emb = self._corpus_memo[key]
+            self.timings["corpus_cache_hits"] += 1
+            logger.info("Reusing %d doc embeddings from memory", len(texts))
+        elif path and path.exists():
             emb = np.load(path)
             self.timings["corpus_cache_hits"] += 1
             logger.info("Loaded %d cached doc embeddings from %s", len(texts), path.name)
@@ -237,6 +242,7 @@ class CodeEncoder(AbsEncoder):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 np.save(path, emb)
                 logger.info("Cached %d doc embeddings to %s", len(texts), path.name)
+        self._corpus_memo[key] = emb
         dt = time.perf_counter() - t0
         self.timings["corpus_encode_s"] += dt
         logger.info("Corpus embeddings ready (%d docs) in %.1fs", len(texts), dt)
@@ -263,6 +269,18 @@ def subsample_task(task, n_queries: int, n_docs: int, seed: int = 0) -> None:
                         subset, split, len(data["queries"]), len(data["corpus"]), len(rel_docs))
 
 
+def set_query_clean(task, original_queries: dict[tuple[str, str], Any], mode: str) -> None:
+    """Replace each split's query texts with clean_query(text, mode), starting from
+    the original texts, so variants don't compound. Applies to every retriever."""
+    for (subset, split), queries in original_queries.items():
+        texts = [clean_query(t, mode) for t in queries["text"]]
+        task.dataset[subset][split]["queries"] = queries.remove_columns("text").add_column("text", texts)
+        n_changed = sum(a != b for a, b in zip(texts, queries["text"]))
+        logger.info("[%s/%s] query-clean=%s: %d/%d queries changed, mean %d -> %d chars",
+                    subset, split, mode, n_changed, len(texts),
+                    np.mean([len(t) for t in queries["text"]]), np.mean([len(t) for t in texts]))
+
+
 def resolve_preset(preset: str | None, model: str | None) -> tuple[str, dict[str, Any]]:
     """--preset wins; else a --model matching a preset's model uses that preset;
     else an unknown --model runs as "custom" with no prefixes."""
@@ -283,6 +301,15 @@ def main() -> None:
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
                     help=f"model + prefixes + pooling from PRESETS (default {DEFAULT_PRESET})")
     ap.add_argument("--model", default=None, help="HF model id; picks the matching preset if there is one")
+    ap.add_argument("--retriever", nargs="+", choices=RETRIEVERS, default=["dense"],
+                    help="dense = embedding model, bm25 = rank_bm25 over code tokens, "
+                         "hybrid = RRF of the two (mteb.HybridSearch)")
+    ap.add_argument("--query-clean", nargs="+", choices=QUERY_CLEAN_MODES, default=["none"],
+                    help="none = raw statement, desc = description only, "
+                         "desc-io = description + Input/Output spec (see query_clean.py)")
+    ap.add_argument("--rrf-k", type=int, default=60, help="RRF rank constant for --retriever hybrid")
+    ap.add_argument("--bm25-weight", type=float, default=1.0,
+                    help="RRF weight of BM25 relative to dense (dense weight is 1.0)")
     ap.add_argument("--max-seq-length", type=int, default=512, help="default for both query and doc length")
     ap.add_argument("--query-max-len", type=int, default=None)
     ap.add_argument("--doc-max-len", type=int, default=None)
@@ -299,6 +326,8 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     t_total = time.perf_counter()
+    retrievers = list(dict.fromkeys(args.retriever))
+    clean_modes = list(dict.fromkeys(args.query_clean))
 
     device = args.device
     if device == "auto":
@@ -306,78 +335,123 @@ def main() -> None:
     logger.info("Device: %s (requested: %s)", device, args.device)
 
     preset_name, cfg = resolve_preset(args.preset, args.model)
-    max_major = cfg.get("max_transformers_major")
-    if max_major is not None and int(transformers.__version__.split(".")[0]) > max_major:
-        raise SystemExit(f"Preset {preset_name!r} needs transformers<{max_major + 1} "
-                         f"(installed {transformers.__version__}); see the note in PRESETS.")
     model_name = args.model or cfg["model"]
     query_prefix = cfg["query_prefix"] if args.query_prefix is None else args.query_prefix
     doc_prefix = cfg["doc_prefix"] if args.doc_prefix is None else args.doc_prefix
     logger.info("Preset: %s | model=%s | query_prefix=%r | doc_prefix=%r",
                 preset_name, model_name, query_prefix, doc_prefix)
 
-    encoder = CodeEncoder(
-        model_name,
-        query_max_len=args.query_max_len or args.max_seq_length,
-        doc_max_len=args.doc_max_len or args.max_seq_length,
-        query_prefix=query_prefix,
-        doc_prefix=doc_prefix,
-        trust_remote_code=cfg["trust_remote_code"],
-        expected_pooling=cfg["pooling"],
-        cache_dir=None if args.no_cache else args.cache_dir,
-        device=device,
-    )
+    encoder = None
+    if {"dense", "hybrid"} & set(retrievers):
+        encoder = CodeEncoder(
+            model_name,
+            query_max_len=args.query_max_len or args.max_seq_length,
+            doc_max_len=args.doc_max_len or args.max_seq_length,
+            query_prefix=query_prefix,
+            doc_prefix=doc_prefix,
+            trust_remote_code=cfg["trust_remote_code"],
+            expected_pooling=cfg["pooling"],
+            cache_dir=None if args.no_cache else args.cache_dir,
+            device=device,
+        )
 
+    # evaluate() leaves pre-loaded data untouched, so the task can be subset
+    # (--smoke) and its query texts swapped per variant (--query-clean) up front.
     task = mteb.get_task(TASK_NAME)
+    task.load_data()
     if args.smoke:
-        # evaluate() leaves pre-loaded data untouched, so we can subset it first.
-        task.load_data()
         subsample_task(task, *args.smoke)
-
-    results = mteb.evaluate(
-        encoder,
-        task,
-        encode_kwargs={"batch_size": args.batch_size},
-        cache=None,  # never serve stale scores from ~/.cache/mteb
-        overwrite_strategy="always",
-    )
-    total_s = time.perf_counter() - t_total
-
-    scores = results.task_results[0].scores["test"][0]
-    ndcg10, mrr10 = scores["ndcg_at_10"], scores["mrr_at_10"]
+    original_queries = {(subset, split): data["queries"]
+                        for subset, splits in task.dataset.items() for split, data in splits.items()}
 
     out = Path(args.out or ("appsretrieval_results.smoke.json" if args.smoke else "appsretrieval_results.json"))
+    mteb_dir = out.with_name(out.stem + "_mteb")
+    mteb_dir.mkdir(parents=True, exist_ok=True)
+
+    variants: list[dict[str, Any]] = []
+    for clean_mode, retriever in itertools.product(clean_modes, retrievers):
+        name = f"{retriever}/{clean_mode}"
+        logger.info("=== Variant %s ===", name)
+        set_query_clean(task, original_queries, clean_mode)
+        if encoder is not None:
+            encoder.reset_timings()
+        bm25 = BM25CodeSearch() if retriever in ("bm25", "hybrid") else None
+        if retriever == "dense":
+            model = encoder
+        elif retriever == "bm25":
+            model = bm25
+        else:
+            model = mteb.HybridSearch([encoder, bm25], weights=[1.0, args.bm25_weight],
+                                      fusion_strategy="rrf", rrf_k=args.rrf_k)
+
+        t0 = time.perf_counter()
+        results = mteb.evaluate(
+            model,
+            task,
+            encode_kwargs={"batch_size": args.batch_size},
+            cache=None,  # never serve stale scores from ~/.cache/mteb
+            overwrite_strategy="always",
+        )
+        eval_s = time.perf_counter() - t0
+
+        task_result = results.task_results[0]
+        result_path = mteb_dir / f"{_slug(name)}.json"
+        task_result.to_disk(result_path)
+        scores = task_result.scores["test"][0]
+        timings: dict[str, Any] = {"eval_s": eval_s}
+        if retriever != "bm25":
+            timings.update(encoder.timings)
+        if bm25 is not None:
+            timings.update(bm25.timings)
+        variants.append({
+            "variant": name,
+            "retriever": retriever,
+            "query_clean": clean_mode,
+            "model": model.mteb_model_meta.name,
+            "ndcg_at_10": scores["ndcg_at_10"],
+            "mrr_at_10": scores["mrr_at_10"],
+            "timings": timings,
+            "mteb_result": str(result_path),
+            "scores": scores,
+        })
+        logger.info("%s: NDCG@10=%.4f MRR@10=%.4f (%.1fs)",
+                    name, scores["ndcg_at_10"], scores["mrr_at_10"], eval_s)
+    total_s = time.perf_counter() - t_total
+
     payload = {
         "task": TASK_NAME,
         "preset": preset_name,
         "model": model_name,
-        "pooling": encoder.pooling,
-        "buffers_restored": encoder.buffers_restored,
+        "pooling": encoder.pooling if encoder else None,
+        "buffers_restored": encoder.buffers_restored if encoder else None,
         "transformers_version": transformers.__version__,
-        "query_max_len": encoder.query_max_len,
-        "doc_max_len": encoder.doc_max_len,
-        "query_prefix": encoder.query_prefix,
-        "doc_prefix": encoder.doc_prefix,
+        "query_max_len": encoder.query_max_len if encoder else None,
+        "doc_max_len": encoder.doc_max_len if encoder else None,
+        "query_prefix": query_prefix,
+        "doc_prefix": doc_prefix,
         "preproc_version": PREPROC_VERSION,
+        "rrf_k": args.rrf_k,
+        "bm25_weight": args.bm25_weight,
         "batch_size": args.batch_size,
         "device": device,
         "cache_dir": None if args.no_cache else str(args.cache_dir),
         "smoke": args.smoke,
         "mteb_version": mteb.__version__,
-        "timings": {**encoder.timings, "total_s": total_s},
-        "ndcg_at_10": ndcg10,
-        "mrr_at_10": mrr10,
-        "scores": scores,
+        "total_s": total_s,
+        "variants": variants,
     }
     out.write_text(json.dumps(payload, indent=2, default=str))
 
-    t = encoder.timings
-    print(f"\n{TASK_NAME} | {preset_name} ({model_name}) | {device} | q_len={encoder.query_max_len} d_len={encoder.doc_max_len}")
-    print(f"  NDCG@10 = {ndcg10:.4f}")
-    print(f"  MRR@10  = {mrr10:.4f}")
-    print(f"  corpus encode {t['corpus_encode_s']:.1f}s (cache hits={t['corpus_cache_hits']}), "
-          f"query encode {t['query_encode_s']:.1f}s, total {total_s:.1f}s")
-    print(f"  -> {out}")
+    lens = f" | q_len={encoder.query_max_len} d_len={encoder.doc_max_len}" if encoder else ""
+    print(f"\n{TASK_NAME} | {preset_name} ({model_name}) | {device}{lens}"
+          + (f" | smoke {args.smoke[0]}q/{args.smoke[1]}d" if args.smoke else ""))
+    width = max(len("variant"), *(len(v["variant"]) for v in variants))
+    print(f"  {'variant':<{width}}  {'NDCG@10':>8}  {'MRR@10':>8}  {'time_s':>8}")
+    for v in variants:
+        print(f"  {v['variant']:<{width}}  {v['ndcg_at_10']:>8.4f}  {v['mrr_at_10']:>8.4f}  "
+              f"{v['timings']['eval_s']:>8.1f}")
+    print(f"  total {total_s:.1f}s (incl. model load / dataset download)")
+    print(f"  -> {out}, {mteb_dir}/")
 
 
 if __name__ == "__main__":

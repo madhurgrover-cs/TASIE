@@ -19,12 +19,14 @@ Nothing SAST-specific has been deleted yet. See the reuse table below before rem
 # API + dashboard (http://localhost:8000/dashboard, docs at /docs)
 python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
-# Retrieval baseline eval (writes appsretrieval_results.json, prints NDCG@10 / MRR@10)
-python -m retrieval.eval_baseline                                   # --preset coderankembed (default)
-python -m retrieval.eval_baseline --preset sfr-code-400m --out appsretrieval_results.sfr-code-400m.json
-python -m retrieval.eval_baseline --smoke 5 300                     # 5 queries / 300 docs → appsretrieval_results.smoke.json
-python -m retrieval.eval_baseline --query-max-len 128 --doc-max-len 512   # lengths are independent; --max-seq-length sets both (default 512)
-python -m retrieval.eval_baseline --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
+# Retrieval eval (writes appsretrieval_results.json + appsretrieval_results_mteb/<variant>.json,
+# prints a summary table: variant, NDCG@10, MRR@10, time). `python -m retrieval.eval_baseline` also works.
+python retrieval/eval_baseline.py                                        # dense CodeRankEmbed, raw queries
+python retrieval/eval_baseline.py --query-clean none desc desc-io        # ablation A (query cleanup)
+python retrieval/eval_baseline.py --retriever dense bm25 hybrid          # ablation B (BM25 + RRF hybrid)
+python retrieval/eval_baseline.py --smoke 5 300                          # 5 queries / 300 docs → appsretrieval_results.smoke.json
+python retrieval/eval_baseline.py --query-max-len 128 --doc-max-len 512  # lengths are independent; --max-seq-length sets both (default 512)
+python retrieval/eval_baseline.py --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
 ```
 
 Run Python from the **project root**, not from inside `.venv/.../site-packages/mteb`. mteb ships a
@@ -45,7 +47,9 @@ backend/
   scanner/sast_core.py  SmartMemory → ML → regex 3-stage scan               [SAST — replace]
 frontend/               single-page dashboard (index.html, app.js, styles.css)
 retrieval/
-  eval_baseline.py      mteb AbsEncoder wrapper + AppsRetrieval eval
+  eval_baseline.py      mteb AbsEncoder wrapper + AppsRetrieval eval (variant grid, summary table)
+  bm25_search.py        code tokenizer + rank_bm25 as an mteb SearchProtocol model (no torch/mteb at import)
+  query_clean.py        APPS problem-statement cleanup for --query-clean (pure Python)
   cache/                corpus embedding cache (gitignored)
 seed_training_data.py   seeds SAST feedback rows                            [SAST — replace]
 Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
@@ -70,22 +74,20 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   - `mteb.evaluate(model, task, encode_kwargs=..., cache=..., overwrite_strategy=...)`. By default it reads `~/.cache/mteb` with `"only-missing"` and would silently return old scores; the script passes `cache=None, overwrite_strategy="always"`.
   - `evaluate()` does not reload or unload a task whose data is already loaded, which is how `--smoke` subsets it.
   - Metric keys: `ndcg_at_10`, `mrr_at_10` in `results.task_results[0].scores["test"][0]`.
-- **Presets** (`--preset`, `PRESETS` in the script). The settings come from each HF model card and the
-  repo's `1_Pooling/config.json`, not from memory. All three need `trust_remote_code=True`, and all are
-  <500M params so they can run on CPU:
+- **Presets** (`--preset`, `PRESETS` in the script). The settings come from the HF model card and the
+  repo's `1_Pooling/config.json`, not from memory. It needs `trust_remote_code=True`:
 
   | Preset | Model | Params | Query prefix | Doc prefix | Pooling | License |
   |---|---|---|---|---|---|---|
   | `coderankembed` (default) | `nomic-ai/CodeRankEmbed` | 137M | `"Represent this query for searching relevant code: "` (card: "*must*") | none | CLS | MIT |
-  | `jina-code` (**transformers<5 only**, exits on v5) | `jinaai/jina-embeddings-v2-base-code` | 161M | none | none | mean | Apache-2.0 |
-  | `sfr-code-400m` | `Salesforce/SFR-Embedding-Code-400M_R` | 434M | none | none | CLS | **CC-BY-NC-4.0** |
 
+  **Dropped** (2026-09-28): `Salesforce/SFR-Embedding-Code-400M_R` still scored NDCG@10 0.0 after the buffer fix.
+  `jinaai/jina-embeddings-v2-base-code` has remote code that needs transformers<5 (see below).
   Pooling comes from the repo; the preset value is only checked and a mismatch is logged as a warning.
-  SFR's "Instruct: ...\nQuery: " template in mteb is registered for the **2B** model only, so the 400M card uses raw text.
   `--model <id>` alone selects the matching preset, and unknown ids run as `custom` with no prefixes.
   `--query-prefix` / `--doc-prefix` override the preset.
-- Models are loaded in **fp32** (`model_kwargs={"torch_dtype": torch.float32}`). The jina and SFR
-  checkpoints are stored in fp16/bf16, and transformers v5 would otherwise keep that dtype.
+- Models are loaded in **fp32** (`model_kwargs={"torch_dtype": torch.float32}`). Some checkpoints
+  are stored in fp16/bf16, and transformers v5 would otherwise keep that dtype.
 - `nomic-ai/CodeRankEmbed` needs `einops`. sentence-transformers 6.1 requires transformers>=5.
 - **transformers v5 + remote code, uninitialised buffers.** v5 loads on the meta device and refills
   every *non-persistent* buffer with `torch.empty_like`, trusting `_init_weights` to restore them.
@@ -99,10 +101,10 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
     via `transformers.initialization.no_init_weights`) and copies the buffers over. It runs for every
     model, logs `Restored N ... (M had uninitialised values)`, and records `buffers_restored` in the
     results JSON.
-- **jina-code doesn't work on transformers v5.** Its remote code (`jinaai/jina-bert-v2-qk-post-norm`)
+- **jina-code doesn't work on transformers v5** (why it was dropped). Its remote code (`jinaai/jina-bert-v2-qk-post-norm`)
   imports `find_pruneable_heads_and_indices` and calls `get_extended_attention_mask` /
   `get_head_mask` / `invert_attention_mask`, all removed in v5. It would need transformers<5, which
-  conflicts with sentence-transformers 6.x, so the preset exits with a clear message.
+  conflicts with sentence-transformers 6.x.
 - Embeddings are L2-normalised, and similarity is cosine.
 - `--device auto|cuda|cpu` (default `auto` = CUDA if `torch.cuda.is_available()`). The resolved
   device is logged at startup and recorded in the results JSON. Screening is CPU, so use GPU for fast iteration only.
@@ -111,8 +113,36 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
 
 | Preset | q_len / d_len | NDCG@10 | MRR@10 | Notes |
 |---|---|---|---|---|
-| `coderankembed` | 512 / 512 | 0.2368 | 0.2066 | **pre-fix (cache p1): suspect.** Likely ran with uninitialised `inv_freq`/`norm_factor`; q_len 1024 gave no gain |
-| `coderankembed` | 512 / 512 | — | — | rerun with the buffer fix (cache p2); `buffers_restored.differed > 0` confirms the old run was affected |
+| `coderankembed` | 512 / 512 | 0.2368 | 0.2066 | pre-fix (cache p1); q_len 1024 gave no gain |
+| `coderankembed` | 512 / 512 | **0.2368** | **0.2073** | **baseline**, with the buffer fix (cache p2), Kaggle-confirmed |
+| `sfr-code-400m` | 512 / 512 | 0.0 | — | still 0.0 after the fix → preset removed |
+
+### Ablations: query cleanup (A) and BM25 hybrid (B)
+
+- `--query-clean` and `--retriever` take several values, and every combination runs as a variant
+  `<retriever>/<clean>`. The model loads once and one summary table is printed at the end. The `time_s`
+  column is the wall time of that variant's `mteb.evaluate()`. Corpus embeddings are memoised in memory
+  across variants, so only the first dense variant pays for corpus encoding (or the cache load).
+- **A) `--query-clean`** (`retrieval/query_clean.py`) rewrites the task's query texts before
+  `evaluate()`, so it applies to every retriever. `none` = raw, `desc` = text before the first section
+  header, `desc-io` = description + Input/Output sections (samples, examples, notes, constraints and
+  explanations dropped). It handles `-----X-----` (Codeforces/CodeChef/AtCoder), `=====X=====` (HackerRank)
+  and bare `Example 1:` / `Note:` / `Constraints:` lines (LeetCode). Statements that begin with a dropped
+  section fall back to the raw text. On a 900-query test sample, median length is 1607 chars raw,
+  1202 for desc-io and 738 for desc.
+- **B) BM25** (`retrieval/bm25_search.py`, `BM25CodeSearch`) implements mteb's `SearchProtocol`
+  (`index()` / `search()` in `mteb/models/models_protocols.py`; `abstasks/retrieval.py` calls a
+  SearchProtocol directly and wraps a plain encoder in `SearchEncoderWrapper`). Tokens are identifiers,
+  lowercased, split on snake_case and camelCase, keeping the compound too (`numRows` → `numrows num rows`).
+  Numbers, 1-char parts and a short list of English function words are dropped. Scoring uses
+  `rank_bm25.BM25Okapi` statistics (k1=1.5, b=0.75, eps=0.25) computed as a sparse matmul, which matches
+  `get_scores()` to 1e-13 but avoids its per-doc Python loop. Zero-score docs are not returned.
+- **Hybrid** = `mteb.HybridSearch([encoder, bm25], fusion_strategy="rrf")` (mteb's own
+  `models/hybrid_wrappers.py`). Each sub-model returns its top 1000, and they are fused as
+  `sum w_i / (rrf_k + rank)`. Flags: `--rrf-k` (default 60) and `--bm25-weight` (default 1.0, with dense
+  weight 1.0).
+- Outputs: `<out>` holds the summary with per-variant scores and timings, and `<out stem>_mteb/<variant>.json`
+  holds mteb's official `TaskResult` (`TaskResult.to_disk`).
 
 ### Corpus embedding cache
 
