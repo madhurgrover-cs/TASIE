@@ -1,0 +1,10 @@
+# Retrieval (Samsung hackathon: MTEB AppsRetrieval, CPU screening).
+#   pip install -r requirements-retrieval.txt
+# Pulls the CPU-only torch wheel (~200 MB instead of the multi-GB CUDA build).
+# On Kaggle GPU keep the preinstalled CUDA torch instead: see KAGGLE.md.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+mteb==2.21.8
+sentence-transformers==6.1.0
+rank-bm25==0.2.2
+einops==0.8.2  # required by nomic-ai/CodeRankEmbed's remote model code
