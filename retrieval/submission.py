@@ -42,8 +42,8 @@ from retrieval.query_clean import clean_query
 logger = logging.getLogger("submission")
 
 TASK_NAME = "AppsRetrieval"
-# TODO: replace with the pushed repo id (retrieval/push_model.py prints it).
-DEFAULT_MODEL = "YOUR_HF_USERNAME/coderankembed-apps-ft"
+# Published with retrieval/push_model.py.
+DEFAULT_MODEL = "madhurr382/coderankembed-apps-ft"
 # From the nomic-ai/CodeRankEmbed model card; fine-tuning used the same prefix.
 QUERY_PREFIX = "Represent this query for searching relevant code: "
 DOC_PREFIX = ""

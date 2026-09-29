@@ -47,7 +47,7 @@ long statements, where samples and constraints make up most of the text.
 The submission encoder is `PrePostPipelineEncoder` in
 [`retrieval/submission.py`](retrieval/submission.py): an mteb `AbsEncoder` that does
 the query cleanup and prefixing inside `encode()` and loads the fine-tuned weights
-from the Hugging Face Hub.
+from the Hugging Face Hub: [`madhurr382/coderankembed-apps-ft`](https://huggingface.co/madhurr382/coderankembed-apps-ft).
 
 ## Results
 
@@ -77,8 +77,8 @@ Ablations that did not make it in:
 ```bash
 python -m venv .venv && source .venv/bin/activate       # Windows: .venv\Scripts\activate
 pip install -r requirements-retrieval.txt                # CPU torch wheel + mteb + sentence-transformers
-python retrieval/submission.py --model <hf-user>/<repo>  # writes appsretrieval_results.json
-python retrieval/submission.py --model <hf-user>/<repo> --smoke 5 300   # quick pipeline check
+python retrieval/submission.py                           # uses madhurr382/coderankembed-apps-ft; writes appsretrieval_results.json
+python retrieval/submission.py --smoke 5 300             # quick pipeline check
 ```
 
 `appsretrieval_results.json` is mteb's `TaskResult.to_dict()`. The scores are under
@@ -99,7 +99,7 @@ python retrieval/finetune.py --output-dir /kaggle/working/cre-ft          # fina
 python retrieval/finetune.py --output-dir /kaggle/working/cre-ft-smoke --smoke   # pipeline check
 python retrieval/eval_baseline.py --model /kaggle/working/cre-ft          # eval a local dir
 HF_TOKEN=hf_... python retrieval/push_model.py --model-dir /kaggle/working/cre-ft \
-    --repo-id <hf-user>/<repo> --ndcg 0.4709 --mrr 0.4303                 # publish
+    --repo-id madhurr382/coderankembed-apps-ft --ndcg 0.4709 --mrr 0.4303   # publish
 ```
 
 `finetune.py` writes the model plus `finetune_config.json` (base preset, run id,

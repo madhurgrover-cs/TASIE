@@ -30,8 +30,8 @@ python retrieval/eval_baseline.py --query-max-len 128 --doc-max-len 512  # lengt
 python retrieval/eval_baseline.py --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
 
 # Submission (PrePostPipelineEncoder, desc-io + prefix inside encode; writes task_result.to_dict())
-python retrieval/submission.py --model <hf-user>/<repo>                       # CPU by default; --smoke 5 300 for a check
-HF_TOKEN=... python retrieval/push_model.py --model-dir /kaggle/working/cre-ft --repo-id <hf-user>/<repo>
+python retrieval/submission.py --model madhurr382/coderankembed-apps-ft                       # CPU by default; --smoke 5 300 for a check
+HF_TOKEN=... python retrieval/push_model.py --model-dir /kaggle/working/cre-ft --repo-id madhurr382/coderankembed-apps-ft
 
 # Fine-tune CodeRankEmbed on the APPS train split (GPU; writes model + finetune_config.json)
 python retrieval/finetune.py --output-dir /kaggle/working/cre-ft                      # CachedMNRL, 2 epochs, best val MRR@10 kept

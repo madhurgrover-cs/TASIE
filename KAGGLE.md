@@ -61,7 +61,7 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 ```
 
 ```python
-REPO_ID = "<hf-user>/coderankembed-apps-ft"   # <- set this
+REPO_ID = "madhurr382/coderankembed-apps-ft"
 !python retrieval/push_model.py --model-dir /kaggle/working/cre-ft --repo-id {REPO_ID} --ndcg 0.4709 --mrr 0.4303
 ```
 
@@ -81,5 +81,5 @@ s = r["scores"]["test"][0]
 print(s["ndcg_at_10"], s["mrr_at_10"])
 ```
 
-After that, set `DEFAULT_MODEL` in `retrieval/submission.py` to `REPO_ID`, so a
-plain `python retrieval/submission.py` uses the published model.
+`DEFAULT_MODEL` in `retrieval/submission.py` is already `madhurr382/coderankembed-apps-ft`, so a plain
+`python retrieval/submission.py` evaluates the published model.
