@@ -52,8 +52,8 @@ path as the Space:
 ```python
 !pip install -q gradio==6.29.0
 %cd /kaggle/working/TASIE/space
-from app import build_engine
-engine = build_engine()
+from app import build_engines
+engine = build_engines()["CPU"]
 r = engine.search("find the length of the longest increasing subsequence", k=3)
 print(f"{r.total_ms:.0f} ms", [(h.doc_id, round(h.score, 4)) for h in r.hits])
 print(r.hits[0].code[:400])
@@ -109,7 +109,7 @@ commit), and `MODEL_ID`, which must match the index manifest or the app refuses 
 
 | File | Role |
 |---|---|
-| `space/app.py` | Gradio Blocks UI and `build_engine()` (downloads, loading, warm-up) |
+| `space/app.py` | Gradio Blocks UI and `build_engines()` (downloads, loading, warm-up; optional ZeroGPU device) |
 | `space/search.py` | `SearchSource` interface, `DenseIndexSource` (exact cosine), `SearchEngine` (merges sources by score, timings) |
 | `space/query_encoder.py` | `STQueryEncoder`: desc-io cleanup + query prefix, as in `retrieval/submission.py` |
 | `space/query_clean.py`, `space/model_loading.py` | verbatim copies of the `retrieval/` modules |

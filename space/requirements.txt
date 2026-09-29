@@ -2,9 +2,13 @@
 # Model stack pinned to what trained and evaluated the model on Kaggle
 # (config_sentence_transformers.json on madhurr382/coderankembed-apps-ft:
 #  pytorch 2.10.0, transformers 5.0.0, sentence-transformers 6.1.0).
-# CPU-only torch wheel: the Space runs on CPU basic.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.10.0+cpu
+# The Space runs on ZeroGPU hardware (a free account can't switch it to cpu-basic), and
+# ZeroGPU only accepts plain PyPI torch versions (2.8.0 ... 2.13.0, no "+cpu" builds).
+# Inference still runs on CPU: app.py never requests a GPU (no @spaces.GPU functions).
+# On cpu-basic hardware, use the smaller CPU wheel instead:
+#   --extra-index-url https://download.pytorch.org/whl/cpu
+#   torch==2.10.0+cpu
+torch==2.10.0
 transformers==5.0.0
 sentence-transformers==6.1.0
 einops==0.8.2  # nomic-ai/CodeRankEmbed remote code

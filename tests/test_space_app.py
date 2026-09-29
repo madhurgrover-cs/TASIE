@@ -40,6 +40,20 @@ class AppTest(unittest.TestCase):
         demo = app.create_demo(self.engine)
         self.assertIsInstance(demo, gradio.Blocks)
 
+    def test_device_option(self):
+        gpu_enc = FakeEncoder()
+        engines = {app.CPU: self.engine, app.ZEROGPU: SearchEngine(gpu_enc, [make_source("APPS corpus")])}
+        demo = app.create_demo(engines)
+        radios = [b for b in demo.blocks.values() if isinstance(b, gradio.Radio)]
+        self.assertEqual(len(radios), 1)
+        self.assertTrue(radios[0].visible)
+        self.assertEqual(radios[0].choices, [(app.CPU, app.CPU), (app.ZEROGPU, app.ZEROGPU)])
+
+    def test_single_engine_hides_device(self):
+        demo = app.create_demo(self.engine)
+        radios = [b for b in demo.blocks.values() if isinstance(b, gradio.Radio)]
+        self.assertFalse(radios[0].visible)
+
     def test_multi_source_label(self):
         engine = SearchEngine(FakeEncoder(), [make_source("APPS corpus"), OtherSource("repo@v1", 0.99)])
         _, updates = app.format_result(engine.search("gcd", k=2), show_source=True)

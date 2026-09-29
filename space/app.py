@@ -1,5 +1,5 @@
 """
-Code-search demo (Hugging Face Space, Gradio SDK, CPU basic).
+Code-search demo (Hugging Face Space, Gradio SDK; CPU inference, optional ZeroGPU).
 
 Natural-language query -> ranked Python solutions from the AppsRetrieval corpus, using
 madhurr382/coderankembed-apps-ft (CodeRankEmbed fine-tuned on APPS train).
@@ -11,6 +11,12 @@ At startup:
   3. encode queries like retrieval/submission.py: desc-io cleanup + query prefix.
 No corpus embedding happens on the Space.
 
+Hardware: queries are encoded on CPU by default (the benchmark setting). On ZeroGPU
+hardware (SPACES_ZERO_GPU=true) the platform requires at least one @spaces.GPU function,
+so a second copy of the model is moved to CUDA and a "ZeroGPU" device option encodes
+the query inside a @spaces.GPU call. Its latency includes GPU allocation. Elsewhere
+(cpu-basic, local, tests) there is no `spaces` import and no device option.
+
 Env overrides: INDEX_REPO, INDEX_REVISION, MODEL_ID (must match the index manifest).
 """
 from __future__ import annotations
@@ -19,6 +25,10 @@ import logging
 import os
 import sys
 from pathlib import Path
+
+ON_ZEROGPU = os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true")
+if ON_ZEROGPU:
+    import spaces  # must be imported before torch / any CUDA package
 
 import gradio as gr
 
@@ -43,9 +53,30 @@ EXAMPLES = [
     "Compute the greatest common divisor of all numbers in a list.",
 ]
 
+CPU, ZEROGPU = "CPU", "ZeroGPU"
+_gpu_encoder = None  # STQueryEncoder on CUDA, set by build_engines() on ZeroGPU
 
-def build_engine() -> SearchEngine:
-    """Download index + model and wire them up. Imports torch lazily."""
+
+def _encode_on_gpu(text: str):
+    return _gpu_encoder.encode_query(text)
+
+
+if ON_ZEROGPU:
+    # Defined at import time so ZeroGPU registers it during startup.
+    _encode_on_gpu = spaces.GPU(duration=20)(_encode_on_gpu)
+
+
+class ZeroGPUEncoder:
+    """QueryEncoder that runs each query inside a @spaces.GPU call."""
+
+    def encode_query(self, text: str):
+        return _encode_on_gpu(text)
+
+
+def build_engines() -> dict[str, SearchEngine]:
+    """Download index + model and wire them up ({CPU: ...} plus {ZeroGPU: ...} on ZeroGPU).
+    Imports torch lazily."""
+    global _gpu_encoder
     from huggingface_hub import snapshot_download
 
     from model_loading import load_st_model
@@ -63,11 +94,18 @@ def build_engine() -> SearchEngine:
     model_dir = snapshot_download(MODEL_ID, revision=m.get("model_revision"))
     model, _ = load_st_model(model_dir, "cpu", trust_remote_code=True)
     model.max_seq_length = m.get("max_seq_length", 512)
-    encoder = STQueryEncoder(model, query_prefix=m.get("query_prefix", ""), query_clean=m.get("query_clean", "desc-io"))
-    engine = SearchEngine(encoder, [source])
-    engine.search("warm up", k=1)  # first forward pass is slow; don't bill it to the first user
-    logger.info("Ready: %d docs (dim %d), model %s @ %s", len(source), source.dim, MODEL_ID, m.get("model_revision"))
-    return engine
+    prep = {"query_prefix": m.get("query_prefix", ""), "query_clean": m.get("query_clean", "desc-io")}
+    engines = {CPU: SearchEngine(STQueryEncoder(model, **prep), [source])}
+    engines[CPU].search("warm up", k=1)  # first forward pass is slow; don't bill it to the first user
+    if ON_ZEROGPU:
+        gpu_model, _ = load_st_model(model_dir, "cpu", trust_remote_code=True)  # buffers fixed on CPU first
+        gpu_model.max_seq_length = model.max_seq_length
+        gpu_model.to("cuda")  # ZeroGPU: tensors move to the GPU when a @spaces.GPU call starts
+        _gpu_encoder = STQueryEncoder(gpu_model, **prep)
+        engines[ZEROGPU] = SearchEngine(ZeroGPUEncoder(), [source])
+    logger.info("Ready: %d docs (dim %d), model %s @ %s, devices %s", len(source), source.dim, MODEL_ID,
+                m.get("model_revision"), list(engines))
+    return engines
 
 
 def _hit_header(rank: int, hit) -> str:
@@ -94,12 +132,15 @@ def format_result(result: SearchResult, show_source: bool) -> tuple[str, list]:
     return status, updates
 
 
-def create_demo(engine: SearchEngine) -> gr.Blocks:
+def create_demo(engines: dict[str, SearchEngine] | SearchEngine) -> gr.Blocks:
+    if isinstance(engines, SearchEngine):
+        engines = {CPU: engines}
+    engine = next(iter(engines.values()))
     multi_source = len(engine.source_names) > 1
 
-    def run(query: str, k: float, sources: list[str] | None):
+    def run(query: str, k: float, sources: list[str] | None, device: str | None = None):
         try:
-            result = engine.search(query, k=int(k), sources=sources or None)
+            result = engines.get(device or CPU, engine).search(query, k=int(k), sources=sources or None)
         except ValueError as e:
             empty = [gr.update(visible=False), gr.update(value=""), gr.update(value="")] * MAX_K
             return [f"⚠️ {e}"] + empty
@@ -112,7 +153,8 @@ def create_demo(engine: SearchEngine) -> gr.Blocks:
             "Describe a programming problem and get ranked Python solutions from the "
             "[APPS](https://huggingface.co/datasets/CoIR-Retrieval/apps) corpus. Model: "
             f"[`{MODEL_ID}`](https://huggingface.co/{MODEL_ID}) (CodeRankEmbed fine-tuned on APPS train, "
-            "AppsRetrieval NDCG@10 0.4720). Runs on CPU; corpus embeddings are precomputed."
+            "AppsRetrieval NDCG@10 0.4720). Queries are encoded on CPU by default; corpus embeddings "
+            "are precomputed."
         )
         with gr.Row():
             query = gr.Textbox(label="Query", placeholder="e.g. find the longest increasing subsequence",
@@ -120,8 +162,12 @@ def create_demo(engine: SearchEngine) -> gr.Blocks:
             with gr.Column(scale=1, min_width=160):
                 k = gr.Slider(1, MAX_K, value=DEFAULT_K, step=1, label="Top-k")
                 btn = gr.Button("Search", variant="primary")
-        sources = gr.CheckboxGroup(engine.source_names, value=engine.source_names, label="Sources",
-                                   visible=multi_source)
+        with gr.Row():
+            sources = gr.CheckboxGroup(engine.source_names, value=engine.source_names, label="Sources",
+                                       visible=multi_source)
+            device = gr.Radio(list(engines), value=CPU, label="Query encoding device",
+                              info="ZeroGPU latency includes GPU allocation (first call is slowest)",
+                              visible=len(engines) > 1)
         gr.Examples(EXAMPLES, inputs=[query], label="Example queries")
         status = gr.Markdown()
         outputs: list = [status]
@@ -131,12 +177,12 @@ def create_demo(engine: SearchEngine) -> gr.Blocks:
                 code = gr.Code(language="python", interactive=False, show_label=False, max_lines=30)
             outputs += [group, header, code]
 
-        btn.click(run, [query, k, sources], outputs)
-        query.submit(run, [query, k, sources], outputs)
+        btn.click(run, [query, k, sources, device], outputs)
+        query.submit(run, [query, k, sources, device], outputs)
     return demo
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    demo = create_demo(build_engine())
+    demo = create_demo(build_engines())
     demo.queue(default_concurrency_limit=2).launch(theme=gr.themes.Soft())
