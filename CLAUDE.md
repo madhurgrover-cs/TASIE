@@ -29,6 +29,10 @@ python retrieval/eval_baseline.py --smoke 5 300                          # 5 que
 python retrieval/eval_baseline.py --query-max-len 128 --doc-max-len 512  # lengths are independent; --max-seq-length sets both (default 512)
 python retrieval/eval_baseline.py --device cpu --cache-dir /kaggle/working/emb_cache   # --device auto|cuda|cpu (auto = cuda if available)
 
+# Submission (PrePostPipelineEncoder, desc-io + prefix inside encode; writes task_result.to_dict())
+python retrieval/submission.py --model <hf-user>/<repo>                       # CPU by default; --smoke 5 300 for a check
+HF_TOKEN=... python retrieval/push_model.py --model-dir /kaggle/working/cre-ft --repo-id <hf-user>/<repo>
+
 # Fine-tune CodeRankEmbed on the APPS train split (GPU; writes model + finetune_config.json)
 python retrieval/finetune.py --output-dir /kaggle/working/cre-ft                      # CachedMNRL, 2 epochs, best val MRR@10 kept
 python retrieval/finetune.py --output-dir /kaggle/working/cre-ft-hn --hard-negatives 1  # + negatives mined with the base model
@@ -57,8 +61,12 @@ retrieval/
   bm25_search.py        code tokenizer + rank_bm25 as an mteb SearchProtocol model (no torch/mteb at import)
   query_clean.py        APPS problem-statement cleanup for --query-clean (pure Python)
   finetune.py           CodeRankEmbed fine-tuning on APPS train (CachedMNRL, optional hard negatives)
+  submission.py         screening submission: PrePostPipelineEncoder, loads the fine-tuned model from the HF Hub
+  push_model.py         upload a finetune.py output dir + model card to the HF Hub (HF_TOKEN)
   cache/                corpus embedding cache (gitignored)
 seed_training_data.py   seeds SAST feedback rows                            [SAST — replace]
+requirements.txt        web app only (Render image); requirements-retrieval.txt = CPU torch + mteb + ST
+README.md, KAGGLE.md    submission write-up and Kaggle cells; old SAST README in docs/SAST_README.md
 Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
 ```
 
@@ -117,6 +125,10 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   device is logged at startup and recorded in the results JSON. Screening is CPU, so use GPU for fast iteration only.
 
 ### Results so far (full AppsRetrieval test split)
+
+**Final (Phase 1 submission):** fine-tuned CodeRankEmbed (finetune.py plain run, 2 epochs, no hard negatives) +
+desc-io, dense → NDCG@10 **0.4709**, MRR@10 **0.4303**. Hard negatives (3 epochs) scored worse on val
+(MRR@10 0.7266 vs 0.7503), so they are not used.
 
 | Preset | q_len / d_len | NDCG@10 | MRR@10 | Notes |
 |---|---|---|---|---|
@@ -183,9 +195,9 @@ to reproduce the ablation table.
   `WinError 1114` on `c10.dll`). Local checks are limited to `py_compile` and static review.
   The FastAPI/SAST parts don't need torch.
 - **Branching:** work on `retrieval-baseline`; don't merge to `main` yet. Render auto-deploys `main`.
-- `requirements.txt` pins `torch==2.14.0`. On Linux (Docker/Render) plain `pip install` pulls the
-  CUDA build (several GB). For CPU-only, install with
-  `--extra-index-url https://download.pytorch.org/whl/cpu`.
+- `requirements.txt` has only the web app deps, so the Render image doesn't pull CUDA torch. Retrieval deps live in
+  `requirements-retrieval.txt`, which pins `torch==2.14.0+cpu` from the PyTorch CPU index. On Kaggle don't install
+  that file (it would replace the CUDA torch); `KAGGLE.md` pip-installs the other pins directly.
 - `pydantic==2.5.2` works with mteb but prints a "protected namespace model_" warning, which is harmless.
 
 ## Fine-tuning: `retrieval/finetune.py`
