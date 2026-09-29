@@ -1,5 +1,5 @@
 """
-Code-search demo (Hugging Face Space, Gradio SDK). Queries are encoded on CPU.
+Code-search demo (Hugging Face Space, Gradio SDK). Queries are encoded on CPU by default.
 
 Two kinds of source, both precomputed on Kaggle, so the Space only encodes queries:
   - "APPS corpus": 8,765 Python solutions from MTEB AppsRetrieval
@@ -9,6 +9,12 @@ Two kinds of source, both precomputed on Kaggle, so the Space only encodes queri
 The model madhurr382/coderankembed-apps-ft is loaded once, at the revision recorded in
 the APPS index manifest; the repo index must have been embedded with the same revision.
 Queries get the same desc-io cleanup + prefix as retrieval/submission.py.
+
+Hardware: the Space runs on ZeroGPU, which refuses to start without a @spaces.GPU
+function. So on ZeroGPU (SPACES_ZERO_GPU=true) a second copy of the model is moved to
+CUDA and a "GPU (optional)" choice encodes the query inside a @spaces.GPU call (its
+latency includes GPU allocation). CPU stays the default. Elsewhere (CPU hardware,
+local, tests) there is no `spaces` import and no device choice.
 
 Env overrides: INDEX_REPO, INDEX_REVISION, REPO_INDEX (empty = no repo source),
 REPO_INDEX_REVISION, MODEL_ID (must match the index manifests).
@@ -20,6 +26,10 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+ON_ZEROGPU = os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true")
+if ON_ZEROGPU:
+    import spaces  # must be imported before torch / any CUDA package
 
 import gradio as gr
 
@@ -52,6 +62,26 @@ REPO_EXAMPLES = [
     ("Merge settings", "merge session-level settings with per-request settings"),
     ("Retry adapter", "mount an HTTP adapter with a maximum number of retries"),
 ]
+CPU, GPU = "CPU", "GPU (optional)"
+_gpu_encoder = None  # STQueryEncoder on CUDA, set by build_state() on ZeroGPU
+
+
+def _encode_on_gpu(text: str):
+    return _gpu_encoder.encode_query(text)
+
+
+if ON_ZEROGPU:
+    # Defined at import time so ZeroGPU registers it during startup.
+    _encode_on_gpu = spaces.GPU(duration=20)(_encode_on_gpu)
+
+
+class ZeroGPUEncoder:
+    """QueryEncoder that runs each query inside a @spaces.GPU call."""
+
+    def encode_query(self, text: str):
+        return _encode_on_gpu(text)
+
+
 CODE_LANGUAGES = {"python", "c", "cpp", "markdown", "json", "html", "css", "javascript", "typescript",
                   "yaml", "shell"}
 
@@ -66,8 +96,10 @@ class RepoInfo:
         return f"{self.name} (git repo)"
 
 
-def build_state() -> tuple[SearchEngine, RepoInfo | None]:
-    """Download indexes + model and wire them up. Imports torch lazily."""
+def build_state() -> tuple[SearchEngine, RepoInfo | None, SearchEngine | None]:
+    """Download indexes + model and wire them up: (CPU engine, repo info, GPU engine on
+    ZeroGPU else None). Imports torch lazily."""
+    global _gpu_encoder
     from huggingface_hub import snapshot_download
 
     from model_loading import load_st_model
@@ -93,11 +125,19 @@ def build_state() -> tuple[SearchEngine, RepoInfo | None]:
     model_dir = snapshot_download(MODEL_ID, revision=m.get("model_revision"))
     model, _ = load_st_model(model_dir, "cpu", trust_remote_code=True)
     model.max_seq_length = m.get("max_seq_length", 512)
-    encoder = STQueryEncoder(model, query_prefix=m.get("query_prefix", ""), query_clean=m.get("query_clean", "desc-io"))
-    engine = SearchEngine(encoder, sources)
+    prep = {"query_prefix": m.get("query_prefix", ""), "query_clean": m.get("query_clean", "desc-io")}
+    engine = SearchEngine(STQueryEncoder(model, **prep), sources)
     engine.search("warm up", k=1, sources=[APPS])  # first forward pass is slow; don't bill it to a user
-    logger.info("Ready: %s | model %s @ %s", {s.name: len(s) for s in sources}, MODEL_ID, m.get("model_revision"))
-    return engine, repo
+    gpu_engine = None
+    if ON_ZEROGPU:
+        gpu_model, _ = load_st_model(model_dir, "cpu", trust_remote_code=True)  # buffers fixed on CPU first
+        gpu_model.max_seq_length = model.max_seq_length
+        gpu_model.to("cuda")  # ZeroGPU: tensors move to the GPU when a @spaces.GPU call starts
+        _gpu_encoder = STQueryEncoder(gpu_model, **prep)
+        gpu_engine = SearchEngine(ZeroGPUEncoder(), sources)
+    logger.info("Ready: %s | model %s @ %s | GPU option: %s", {s.name: len(s) for s in sources}, MODEL_ID,
+                m.get("model_revision"), gpu_engine is not None)
+    return engine, repo, gpu_engine
 
 
 def load_repo(dataset: str, revision: str | None, expected_model_id: str):
@@ -135,10 +175,11 @@ def _hit_header(rank: int, hit: Hit) -> str:
     return " · ".join(parts)
 
 
-def format_result(result: SearchResult, scope: str = "") -> tuple[str, list]:
+def format_result(result: SearchResult, scope: str = "", device: str = CPU) -> tuple[str, list]:
     """Status line + MAX_K * (group, header, code) updates."""
+    where = "GPU, incl. allocation" if device == GPU else "CPU"
     status = (f"{len(result.hits)} results from {result.n_searched:,} snippets{scope} in "
-              f"**{result.total_ms:.0f} ms** (encode {result.encode_ms:.0f} ms, search {result.search_ms:.1f} ms, CPU)")
+              f"**{result.total_ms:.0f} ms** (encode {result.encode_ms:.0f} ms, search {result.search_ms:.1f} ms, {where})")
     updates: list = []
     for i in range(MAX_K):
         if i < len(result.hits):
@@ -155,11 +196,13 @@ def _empty(message: str) -> list:
     return [message] + [gr.update(visible=False), gr.update(value=""), gr.update(value="")] * MAX_K
 
 
-def create_demo(engine: SearchEngine, repo: RepoInfo | None = None) -> gr.Blocks:
+def create_demo(engine: SearchEngine, repo: RepoInfo | None = None,
+                gpu_engine: SearchEngine | None = None) -> gr.Blocks:
     versions = dict(repo.versions) if repo else {}
     choices = [APPS] + ([repo.choice] if repo else [])
+    engines = {CPU: engine, **({GPU: gpu_engine} if gpu_engine else {})}
 
-    def run(query: str, k: float, where: str, version: str | None):
+    def run(query: str, k: float, where: str, version: str | None, device: str | None = CPU):
         if repo and where == repo.choice:
             if version not in versions:
                 return _empty("⚠️ pick a commit")
@@ -167,10 +210,11 @@ def create_demo(engine: SearchEngine, repo: RepoInfo | None = None) -> gr.Blocks
         else:
             source, scope = APPS, ""
         try:
-            result = engine.search(query, k=int(k), sources=[source])
+            device = device if device in engines else CPU
+            result = engines[device].search(query, k=int(k), sources=[source])
         except ValueError as e:
             return _empty(f"⚠️ {e}")
-        status, updates = format_result(result, scope)
+        status, updates = format_result(result, scope, device)
         return [status] + updates
 
     def on_source(where: str):
@@ -196,6 +240,8 @@ def create_demo(engine: SearchEngine, repo: RepoInfo | None = None) -> gr.Blocks
                                lines=2, scale=5, autofocus=True)
             with gr.Column(scale=1, min_width=160):
                 k = gr.Slider(1, MAX_K, value=DEFAULT_K, step=1, label="Top-k")
+                device = gr.Radio(list(engines), value=CPU, label="Query encoding",
+                                  info="GPU latency includes GPU allocation", visible=len(engines) > 1)
                 btn = gr.Button("Search", variant="primary")
         with gr.Column(visible=True) as apps_examples:
             gr.Examples([q for _, q in APPS_EXAMPLES], inputs=[query], label="Examples (APPS)",
@@ -213,8 +259,8 @@ def create_demo(engine: SearchEngine, repo: RepoInfo | None = None) -> gr.Blocks
             outputs += [group, header, code]
 
         where.change(on_source, [where], [version, apps_examples, repo_examples])
-        btn.click(run, [query, k, where, version], outputs)
-        query.submit(run, [query, k, where, version], outputs)
+        btn.click(run, [query, k, where, version, device], outputs)
+        query.submit(run, [query, k, where, version, device], outputs)
     return demo
 
 

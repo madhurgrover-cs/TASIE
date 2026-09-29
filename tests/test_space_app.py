@@ -37,17 +37,32 @@ class AppTest(unittest.TestCase):
         self.assertEqual(code["language"], "python")
         self.assertFalse(updates[3 * 3]["visible"])  # slot 4 hidden
 
-    def test_demo_builds_without_repo(self):
+    def radios(self, demo):
+        return {b.label: b for b in demo.blocks.values() if isinstance(b, gradio.Radio)}
+
+    def test_demo_builds_without_repo_or_gpu(self):
         demo = app.create_demo(self.engine)
         self.assertIsInstance(demo, gradio.Blocks)
-        radios = [b for b in demo.blocks.values() if isinstance(b, gradio.Radio)]
-        self.assertEqual(len(radios), 1)
-        self.assertFalse(radios[0].visible)  # nothing to pick from
+        radios = self.radios(demo)
+        self.assertFalse(radios["Search in"].visible)  # nothing to pick from
+        self.assertFalse(radios["Query encoding"].visible)  # no GPU engine off ZeroGPU
 
-    def test_no_zerogpu(self):
+    def test_gpu_option_cpu_default(self):
+        gpu_enc = FakeEncoder()
+        gpu = SearchEngine(gpu_enc, [make_source(app.APPS)])
+        demo = app.create_demo(self.engine, None, gpu)
+        radio = self.radios(demo)["Query encoding"]
+        self.assertTrue(radio.visible)
+        self.assertEqual(radio.value, app.CPU)
+        self.assertEqual([c[0] for c in radio.choices], ["CPU", "GPU (optional)"])
+        status, _ = app.format_result(gpu.search("gcd", k=1), device=app.GPU)
+        self.assertIn("GPU, incl. allocation", status)
+        self.assertIn(", CPU)", app.format_result(self.engine.search("gcd", k=1))[0])
+
+    def test_zerogpu_function_registered_only_on_zerogpu(self):
         src = open(app.__file__, encoding="utf-8").read()
-        self.assertNotIn("spaces.GPU", src)
-        self.assertNotIn("ZeroGPU", src)
+        self.assertIn("spaces.GPU(", src)  # ZeroGPU refuses to start without one
+        self.assertFalse(app.ON_ZEROGPU)  # not set locally: no `spaces` import, plain function
 
     def test_example_labels_are_short(self):
         for label, query in app.APPS_EXAMPLES + app.REPO_EXAMPLES:
@@ -58,9 +73,9 @@ class AppTest(unittest.TestCase):
         engine = SearchEngine(FakeEncoder(), [make_source(app.APPS), OtherSource("org/repo@abc1234", 0.99)])
         repo = app.RepoInfo("org/repo", [("v1 · abc1234", "org/repo@abc1234")])
         demo = app.create_demo(engine, repo)
-        radios = [b for b in demo.blocks.values() if isinstance(b, gradio.Radio)]
-        self.assertTrue(radios[0].visible)
-        self.assertEqual([c[0] for c in radios[0].choices], [app.APPS, "org/repo (git repo)"])
+        where = self.radios(demo)["Search in"]
+        self.assertTrue(where.visible)
+        self.assertEqual([c[0] for c in where.choices], [app.APPS, "org/repo (git repo)"])
         dropdowns = [b for b in demo.blocks.values() if isinstance(b, gradio.Dropdown)]
         self.assertEqual(dropdowns[0].value, "v1 · abc1234")
 

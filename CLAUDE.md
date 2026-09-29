@@ -210,8 +210,9 @@ to reproduce the ablation table.
   The FastAPI/SAST parts don't need torch.
 - **Branching:** Phase 1 is merged to `main` (release v1.0). Space work is on `deploy-space`, Phase 2 on
   `phase2-versions`; never push these to `main`: Render auto-deploys `main` to a friend's account.
-- **Space hardware:** `code-search-demo` is ZeroGPU and a free account can't downgrade it (HTTP 402). ZeroGPU
-  needs a `@spaces.GPU` function and rejects `+cpu` torch; the Phase 2 app is CPU only (see DEPLOY_SPACE.md).
+- **Space hardware:** `code-search-demo` stays on ZeroGPU (user's decision; a free account can't downgrade it
+  anyway, HTTP 402). ZeroGPU needs a `@spaces.GPU` function and rejects `+cpu` torch, so the app keeps a
+  "GPU (optional)" encode path with CPU as the default, and pins `torch==2.10.0`. Don't create a new Space.
 - `requirements.txt` has only the web app deps, so the Render image doesn't pull CUDA torch. Retrieval deps live in
   `requirements-retrieval.txt`, which pins `torch==2.14.0+cpu` from the PyTorch CPU index. On Kaggle don't install
   that file (it would replace the CUDA torch); `KAGGLE.md` pip-installs the other pins directly.

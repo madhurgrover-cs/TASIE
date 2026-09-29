@@ -14,27 +14,18 @@ The Space never embeds code. It downloads the precomputed indexes at startup, th
 the model at the exact revision recorded in the APPS manifest. The repo index must have
 been embedded with that same revision, and the app checks this.
 
-## Hardware (read first)
+## Hardware
 
-The app is **CPU only**. `madhurr382/code-search-demo` currently runs on **ZeroGPU**
-(`zero-a10g`), and a free account can't switch it to CPU basic (the API returns HTTP 402).
-ZeroGPU refuses to start an app without a `@spaces.GPU` function (`No @spaces.GPU function
-detected during startup`), and it rejects the `torch==2.10.0+cpu` wheel. So this version
-**will not start on the current Space**. Pick one:
+`madhurr382/code-search-demo` runs on **ZeroGPU** (`zero-a10g`), and it stays there. ZeroGPU
+refuses to start an app without a `@spaces.GPU` function, and it only accepts plain PyPI
+torch versions (not `+cpu`). So:
 
-1. **Create a CPU basic Space** (free) and deploy there, e.g. `madhurr382/code-search`:
-   ```powershell
-   python -c "from huggingface_hub import HfApi; print(HfApi().create_repo('madhurr382/code-search', repo_type='space', space_sdk='gradio', space_hardware='cpu-basic'))"
-   ```
-   Then use that id in step (c)4. New free Spaces default to CPU basic.
-2. Switch `code-search-demo` to CPU basic under *Settings → Space hardware* (needs PRO).
-3. Stay on ZeroGPU with the Phase 1 app from branch `deploy-space`, which has an optional
-   GPU device for exactly this reason.
+- queries are encoded on **CPU by default**, the setting the benchmark numbers come from;
+- a **"GPU (optional)"** choice encodes the query inside a `@spaces.GPU` call. Its latency
+  includes GPU allocation, so it's usually slower for a single short query;
+- `space/requirements.txt` pins `torch==2.10.0` (plain PyPI).
 
-Check a Space's hardware at any time:
-```powershell
-python -c "from huggingface_hub import HfApi; print(HfApi().get_space_runtime('madhurr382/code-search-demo').requested_hardware)"
-```
+Off ZeroGPU (locally, in tests) there is no `spaces` import and no device choice.
 
 ## (a) Kaggle: APPS corpus index
 
@@ -133,14 +124,14 @@ From the repo root on the laptop. Nothing here needs torch.
    python -c "import json,urllib.request as u; r=json.load(u.urlopen('https://huggingface.co/datasets/madhurr382/repo-versions-index/resolve/main/registry.json')); print(r['model_id'], len(r['versions']))"
    ```
    Expected: `madhurr382/coderankembed-apps-ft@c9f6787afd037f4981130ce48335723ed7e65057 4`.
-4. Upload to a **CPU basic** Space (see *Hardware*). Replace `SPACE` with the id you use:
+4. Upload to the existing Space:
    ```powershell
-   $SPACE = "madhurr382/code-search"
-   hf upload $SPACE space . --repo-type space --exclude "__pycache__/*" --exclude "*.pyc" --commit-message "Phase 2: versioned repo search"
+   hf upload madhurr382/code-search-demo space . --repo-type space --exclude "__pycache__/*" --exclude "*.pyc" --commit-message "Phase 2: versioned repo search"
    ```
 5. Watch *Logs* on the Space page. At startup it downloads both indexes and the model, then logs
    `Ready: {'APPS corpus': 8765, 'psf/requests@4401620': ..., ...}`. If the repo index can't be
-   loaded (e.g. wrong model revision), the app logs the reason and serves APPS only.
+   loaded (e.g. wrong model revision), the app logs the reason and serves APPS only. The log
+   line ends with `GPU option: True` on ZeroGPU.
 
 Both indexes and the model are public, so the Space needs no secrets. Optional variables
 (*Settings → Variables*): `INDEX_REPO`, `INDEX_REVISION`, `REPO_INDEX` (set to empty to
@@ -148,7 +139,10 @@ disable the repo source), `REPO_INDEX_REVISION`, `MODEL_ID`.
 
 ## Troubleshooting
 
-- **`No @spaces.GPU function detected during startup`**: the Space is on ZeroGPU; see *Hardware*.
+- **`No @spaces.GPU function detected during startup`**: `SPACES_ZERO_GPU` wasn't seen at import
+  time, or the `@spaces.GPU` wrapper in `app.py` was removed; see *Hardware*.
+- **`torch version in requirements.txt is not compatible with ZeroGPU`**: keep `torch==2.10.0`
+  without `+cpu` in `space/requirements.txt`.
 - **`index ... was built with X, app expects Y`**: `MODEL_ID` doesn't match the APPS index.
 - **`Repo index ... not loaded ... embedded with ...`**: rerun (b) with `--revision` set to
   the APPS manifest's `model_revision`.
@@ -162,7 +156,7 @@ disable the repo source), `REPO_INDEX_REVISION`, `MODEL_ID`.
 
 | File | Role |
 |---|---|
-| `space/app.py` | Gradio UI (source picker, commit dropdown, examples) and `build_state()` (downloads, loading, warm-up) |
+| `space/app.py` | Gradio UI (source picker, commit dropdown, examples, CPU / GPU (optional)) and `build_state()` (downloads, loading, warm-up) |
 | `space/search.py` | `SearchSource` interface, `DenseIndexSource` (APPS), `SearchEngine` (encode once, search selected sources) |
 | `space/versioned_source.py` | `VersionedRepoSource`: one `SearchSource` per indexed commit; hits carry path / name / lines / commit |
 | `space/query_encoder.py` | `STQueryEncoder`: desc-io cleanup + query prefix, as in `retrieval/submission.py` |

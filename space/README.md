@@ -29,7 +29,8 @@ Describe a programming problem and get ranked Python solutions from the 8,765-sn
   prefixed with `Represent this query for searching relevant code: `, like the benchmark submission.
 - **Corpus embeddings** are precomputed on GPU
   ([`madhurr382/apps-corpus-index`](https://huggingface.co/datasets/madhurr382/apps-corpus-index)).
-  The Space only encodes the query on CPU and does an exact cosine search.
+  The Space only encodes the query (on CPU by default; "GPU (optional)" uses ZeroGPU) and does an
+  exact cosine search.
 - **Versioned repo search:** [psf/requests](https://github.com/psf/requests) indexed at four commits
   from 2013 to 2024 with function/class-level chunks
   ([`madhurr382/repo-versions-index`](https://huggingface.co/datasets/madhurr382/repo-versions-index)).

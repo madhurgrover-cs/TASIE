@@ -2,11 +2,13 @@
 # Model stack pinned to what trained and evaluated the model on Kaggle
 # (config_sentence_transformers.json on madhurr382/coderankembed-apps-ft:
 #  pytorch 2.10.0, transformers 5.0.0, sentence-transformers 6.1.0).
-# CPU-only torch wheel: the app encodes queries on CPU (CPU basic hardware).
-# ZeroGPU hardware rejects "+cpu" builds and also requires a @spaces.GPU function,
-# which this app deliberately doesn't have; see DEPLOY_SPACE.md "Hardware".
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.10.0+cpu
+# The Space runs on ZeroGPU hardware, which only accepts plain PyPI torch versions
+# (2.8.0 ... 2.13.0, no "+cpu" builds). Queries are still encoded on CPU by default;
+# the GPU path is an optional choice in the UI.
+# On CPU-only hardware, the smaller CPU wheel works instead:
+#   --extra-index-url https://download.pytorch.org/whl/cpu
+#   torch==2.10.0+cpu
+torch==2.10.0
 transformers==5.0.0
 sentence-transformers==6.1.0
 einops==0.8.2  # nomic-ai/CodeRankEmbed remote code
