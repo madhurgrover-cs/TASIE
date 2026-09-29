@@ -1,174 +1,209 @@
 """
-Code-search demo (Hugging Face Space, Gradio SDK; CPU inference, optional ZeroGPU).
+Code-search demo (Hugging Face Space, Gradio SDK). Queries are encoded on CPU.
 
-Natural-language query -> ranked Python solutions from the AppsRetrieval corpus, using
-madhurr382/coderankembed-apps-ft (CodeRankEmbed fine-tuned on APPS train).
+Two kinds of source, both precomputed on Kaggle, so the Space only encodes queries:
+  - "APPS corpus": 8,765 Python solutions from MTEB AppsRetrieval
+    (dataset madhurr382/apps-corpus-index, retrieval/precompute_corpus.py);
+  - a git repo indexed at several commits, one SearchSource per commit
+    (dataset madhurr382/repo-versions-index, retrieval/versioned/precompute_repo.py).
+The model madhurr382/coderankembed-apps-ft is loaded once, at the revision recorded in
+the APPS index manifest; the repo index must have been embedded with the same revision.
+Queries get the same desc-io cleanup + prefix as retrieval/submission.py.
 
-At startup:
-  1. download the precomputed corpus index (dataset repo, see retrieval/precompute_corpus.py);
-  2. download the model at the exact revision recorded in the index manifest, and load
-     it on CPU with load_st_model (fp32 + transformers v5 buffer fix);
-  3. encode queries like retrieval/submission.py: desc-io cleanup + query prefix.
-No corpus embedding happens on the Space.
-
-Hardware: queries are encoded on CPU by default (the benchmark setting). On ZeroGPU
-hardware (SPACES_ZERO_GPU=true) the platform requires at least one @spaces.GPU function,
-so a second copy of the model is moved to CUDA and a "ZeroGPU" device option encodes
-the query inside a @spaces.GPU call. Its latency includes GPU allocation. Elsewhere
-(cpu-basic, local, tests) there is no `spaces` import and no device option.
-
-Env overrides: INDEX_REPO, INDEX_REVISION, MODEL_ID (must match the index manifest).
+Env overrides: INDEX_REPO, INDEX_REVISION, REPO_INDEX (empty = no repo source),
+REPO_INDEX_REVISION, MODEL_ID (must match the index manifests).
 """
 from __future__ import annotations
 
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-
-ON_ZEROGPU = os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true")
-if ON_ZEROGPU:
-    import spaces  # must be imported before torch / any CUDA package
 
 import gradio as gr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from search import MANIFEST_FILE, DenseIndexSource, SearchEngine, SearchResult  # noqa: E402
+from search import DenseIndexSource, Hit, SearchEngine, SearchResult  # noqa: E402
 
 logger = logging.getLogger("space")
 
 MODEL_ID = os.environ.get("MODEL_ID", "madhurr382/coderankembed-apps-ft")
 INDEX_REPO = os.environ.get("INDEX_REPO", "madhurr382/apps-corpus-index")
 INDEX_REVISION = os.environ.get("INDEX_REVISION") or None
-SOURCE_NAME = "APPS corpus"
+REPO_INDEX = os.environ.get("REPO_INDEX", "madhurr382/repo-versions-index")
+REPO_INDEX_REVISION = os.environ.get("REPO_INDEX_REVISION") or None
+APPS = "APPS corpus"
 MAX_K = 10
 DEFAULT_K = 5
 
-EXAMPLES = [
-    "Find the length of the longest increasing subsequence of an array.",
-    "Count the number of ways to climb n stairs taking 1 or 2 steps at a time, modulo 10^9+7.",
-    "Given a grid of 0s and 1s, count the number of islands of connected 1s.",
-    "Check whether a string is a palindrome after removing at most one character.",
-    "Find the shortest path between two nodes in an unweighted graph using BFS.",
-    "Compute the greatest common divisor of all numbers in a list.",
+# (short label shown in the UI, full query)
+APPS_EXAMPLES = [
+    ("Longest increasing subsequence", "Find the length of the longest strictly increasing subsequence of an array."),
+    ("Count islands", "Given a grid of 0s and 1s, count the number of islands of connected 1s."),
+    ("Stairs, mod 1e9+7", "Count the ways to climb n stairs taking 1 or 2 steps at a time, modulo 10^9+7."),
+    ("Almost palindrome", "Check whether a string can become a palindrome by removing at most one character."),
+    ("BFS shortest path", "Find the shortest path between two nodes in an unweighted graph."),
 ]
-
-CPU, ZEROGPU = "CPU", "ZeroGPU"
-_gpu_encoder = None  # STQueryEncoder on CUDA, set by build_engines() on ZeroGPU
-
-
-def _encode_on_gpu(text: str):
-    return _gpu_encoder.encode_query(text)
-
-
-if ON_ZEROGPU:
-    # Defined at import time so ZeroGPU registers it during startup.
-    _encode_on_gpu = spaces.GPU(duration=20)(_encode_on_gpu)
+REPO_EXAMPLES = [
+    ("Proxies from env", "get proxy settings from environment variables"),
+    ("Auth on redirect", "strip the Authorization header when redirected to another host"),
+    ("Multipart upload", "encode files for a multipart/form-data POST body"),
+    ("Merge settings", "merge session-level settings with per-request settings"),
+    ("Retry adapter", "mount an HTTP adapter with a maximum number of retries"),
+]
+CODE_LANGUAGES = {"python", "c", "cpp", "markdown", "json", "html", "css", "javascript", "typescript",
+                  "yaml", "shell"}
 
 
-class ZeroGPUEncoder:
-    """QueryEncoder that runs each query inside a @spaces.GPU call."""
+@dataclass
+class RepoInfo:
+    name: str  # e.g. "psf/requests"
+    versions: list[tuple[str, str]] = field(default_factory=list)  # (dropdown label, source name), newest first
 
-    def encode_query(self, text: str):
-        return _encode_on_gpu(text)
+    @property
+    def choice(self) -> str:
+        return f"{self.name} (git repo)"
 
 
-def build_engines() -> dict[str, SearchEngine]:
-    """Download index + model and wire them up ({CPU: ...} plus {ZeroGPU: ...} on ZeroGPU).
-    Imports torch lazily."""
-    global _gpu_encoder
+def build_state() -> tuple[SearchEngine, RepoInfo | None]:
+    """Download indexes + model and wire them up. Imports torch lazily."""
     from huggingface_hub import snapshot_download
 
     from model_loading import load_st_model
     from query_encoder import STQueryEncoder
 
     index_dir = snapshot_download(INDEX_REPO, repo_type="dataset", revision=INDEX_REVISION)
-    source = DenseIndexSource.from_dir(index_dir, name=SOURCE_NAME)
-    m = source.manifest
+    apps = DenseIndexSource.from_dir(index_dir, name=APPS)
+    m = apps.manifest
     if m.get("model_id") != MODEL_ID:
         raise RuntimeError(f"index {INDEX_REPO} was built with {m.get('model_id')!r}, app expects {MODEL_ID!r}; "
                            "rebuild the index or set MODEL_ID")
+    sources, repo = [apps], None
+    if REPO_INDEX:
+        try:
+            repo_sources, repo = load_repo(REPO_INDEX, REPO_INDEX_REVISION, f"{MODEL_ID}@{m.get('model_revision')}")
+            sources += repo_sources
+        except Exception:  # the APPS demo still works without the repo index
+            logger.exception("Repo index %s not loaded", REPO_INDEX)
+
     # Local snapshot at the index's model revision: NomicBert's remote code ignores
-    # `revision` for Hub weights, so loading from a pinned local dir is the only way
-    # to guarantee query and corpus embeddings come from the same weights.
+    # `revision` for Hub weights, so a pinned local dir guarantees query and corpus
+    # embeddings come from the same weights.
     model_dir = snapshot_download(MODEL_ID, revision=m.get("model_revision"))
     model, _ = load_st_model(model_dir, "cpu", trust_remote_code=True)
     model.max_seq_length = m.get("max_seq_length", 512)
-    prep = {"query_prefix": m.get("query_prefix", ""), "query_clean": m.get("query_clean", "desc-io")}
-    engines = {CPU: SearchEngine(STQueryEncoder(model, **prep), [source])}
-    engines[CPU].search("warm up", k=1)  # first forward pass is slow; don't bill it to the first user
-    if ON_ZEROGPU:
-        gpu_model, _ = load_st_model(model_dir, "cpu", trust_remote_code=True)  # buffers fixed on CPU first
-        gpu_model.max_seq_length = model.max_seq_length
-        gpu_model.to("cuda")  # ZeroGPU: tensors move to the GPU when a @spaces.GPU call starts
-        _gpu_encoder = STQueryEncoder(gpu_model, **prep)
-        engines[ZEROGPU] = SearchEngine(ZeroGPUEncoder(), [source])
-    logger.info("Ready: %d docs (dim %d), model %s @ %s, devices %s", len(source), source.dim, MODEL_ID,
-                m.get("model_revision"), list(engines))
-    return engines
+    encoder = STQueryEncoder(model, query_prefix=m.get("query_prefix", ""), query_clean=m.get("query_clean", "desc-io"))
+    engine = SearchEngine(encoder, sources)
+    engine.search("warm up", k=1, sources=[APPS])  # first forward pass is slow; don't bill it to a user
+    logger.info("Ready: %s | model %s @ %s", {s.name: len(s) for s in sources}, MODEL_ID, m.get("model_revision"))
+    return engine, repo
 
 
-def _hit_header(rank: int, hit) -> str:
-    parts = [f"**#{rank}**", f"score **{hit.score:.4f}**", f"id `{hit.doc_id}`"]
-    if hit.meta.get("partition"):
-        parts.append(f"split {hit.meta['partition']}")
-    if hit.url and hit.url.startswith(("https://", "http://")):
-        parts.append(f"[problem](<{hit.url}>)")
+def load_repo(dataset: str, revision: str | None, expected_model_id: str):
+    from huggingface_hub import snapshot_download
+
+    from versioned_source import load_repo_sources
+
+    store, sources = load_repo_sources(snapshot_download(dataset, repo_type="dataset", revision=revision))
+    if store.model_id != expected_model_id:
+        raise RuntimeError(f"{dataset} was embedded with {store.model_id!r}, queries use {expected_model_id!r}; "
+                           "rebuild it with the same model revision")
+    return sources, repo_info(store.registry.repo or dataset, sources)
+
+
+def repo_info(name: str, sources) -> RepoInfo:
+    """Dropdown entries, newest commit first (sources come oldest first)."""
+    return RepoInfo(name, [(s.label, s.name) for s in reversed(sources)])
+
+
+# ---- rendering
+def _hit_header(rank: int, hit: Hit) -> str:
+    parts = [f"**#{rank}**", f"score **{hit.score:.4f}**"]
+    meta = hit.meta
+    if "path" in meta:  # repo chunk
+        s, e = meta["start_line"], meta["end_line"]
+        parts += [f"`{meta['path']}`", f"**`{meta['name']}`** ({meta['kind']})", f"L{s}–{e}" if e != s else f"L{s}"]
+        if hit.url:
+            parts.append(f"[GitHub](<{hit.url}>)")
+    else:  # APPS solution
+        parts.append(f"id `{hit.doc_id}`")
+        if meta.get("partition"):
+            parts.append(f"split {meta['partition']}")
+        if hit.url and hit.url.startswith(("https://", "http://")):
+            parts.append(f"[problem](<{hit.url}>)")
     return " · ".join(parts)
 
 
-def format_result(result: SearchResult, show_source: bool) -> tuple[str, list]:
+def format_result(result: SearchResult, scope: str = "") -> tuple[str, list]:
     """Status line + MAX_K * (group, header, code) updates."""
-    status = (f"{len(result.hits)} results from {result.n_searched:,} snippets in "
-              f"**{result.total_ms:.0f} ms** (encode {result.encode_ms:.0f} ms, search {result.search_ms:.1f} ms)")
+    status = (f"{len(result.hits)} results from {result.n_searched:,} snippets{scope} in "
+              f"**{result.total_ms:.0f} ms** (encode {result.encode_ms:.0f} ms, search {result.search_ms:.1f} ms, CPU)")
     updates: list = []
     for i in range(MAX_K):
         if i < len(result.hits):
             hit = result.hits[i]
-            header = _hit_header(i + 1, hit) + (f" · {hit.source}" if show_source else "")
-            updates += [gr.update(visible=True), gr.update(value=header), gr.update(value=hit.code)]
+            lang = hit.language if hit.language in CODE_LANGUAGES else None
+            updates += [gr.update(visible=True), gr.update(value=_hit_header(i + 1, hit)),
+                        gr.update(value=hit.code, language=lang)]
         else:
             updates += [gr.update(visible=False), gr.update(value=""), gr.update(value="")]
     return status, updates
 
 
-def create_demo(engines: dict[str, SearchEngine] | SearchEngine) -> gr.Blocks:
-    if isinstance(engines, SearchEngine):
-        engines = {CPU: engines}
-    engine = next(iter(engines.values()))
-    multi_source = len(engine.source_names) > 1
+def _empty(message: str) -> list:
+    return [message] + [gr.update(visible=False), gr.update(value=""), gr.update(value="")] * MAX_K
 
-    def run(query: str, k: float, sources: list[str] | None, device: str | None = None):
+
+def create_demo(engine: SearchEngine, repo: RepoInfo | None = None) -> gr.Blocks:
+    versions = dict(repo.versions) if repo else {}
+    choices = [APPS] + ([repo.choice] if repo else [])
+
+    def run(query: str, k: float, where: str, version: str | None):
+        if repo and where == repo.choice:
+            if version not in versions:
+                return _empty("⚠️ pick a commit")
+            source, scope = versions[version], f" of {repo.name} @ {version}"
+        else:
+            source, scope = APPS, ""
         try:
-            result = engines.get(device or CPU, engine).search(query, k=int(k), sources=sources or None)
+            result = engine.search(query, k=int(k), sources=[source])
         except ValueError as e:
-            empty = [gr.update(visible=False), gr.update(value=""), gr.update(value="")] * MAX_K
-            return [f"⚠️ {e}"] + empty
-        status, updates = format_result(result, show_source=multi_source)
+            return _empty(f"⚠️ {e}")
+        status, updates = format_result(result, scope)
         return [status] + updates
+
+    def on_source(where: str):
+        is_repo = bool(repo) and where == repo.choice
+        return gr.update(visible=is_repo), gr.update(visible=not is_repo), gr.update(visible=is_repo)
 
     with gr.Blocks(title="Code Search") as demo:
         gr.Markdown(
             "# Natural-language → code search\n"
-            "Describe a programming problem and get ranked Python solutions from the "
-            "[APPS](https://huggingface.co/datasets/CoIR-Retrieval/apps) corpus. Model: "
+            "Describe what the code should do and get ranked snippets, from the "
+            "[APPS](https://huggingface.co/datasets/CoIR-Retrieval/apps) solutions or from a real git repo at "
+            "several points in its history. Model: "
             f"[`{MODEL_ID}`](https://huggingface.co/{MODEL_ID}) (CodeRankEmbed fine-tuned on APPS train, "
-            "AppsRetrieval NDCG@10 0.4720). Queries are encoded on CPU by default; corpus embeddings "
-            "are precomputed."
+            "AppsRetrieval NDCG@10 0.4720). Queries are encoded on CPU; all code embeddings are precomputed."
         )
+        with gr.Row():
+            where = gr.Radio(choices, value=APPS, label="Search in", visible=len(choices) > 1, scale=2)
+            version = gr.Dropdown([label for label, _ in repo.versions] if repo else [],
+                                  value=repo.versions[0][0] if repo and repo.versions else None,
+                                  label="Commit", visible=False, scale=2)
         with gr.Row():
             query = gr.Textbox(label="Query", placeholder="e.g. find the longest increasing subsequence",
                                lines=2, scale=5, autofocus=True)
             with gr.Column(scale=1, min_width=160):
                 k = gr.Slider(1, MAX_K, value=DEFAULT_K, step=1, label="Top-k")
                 btn = gr.Button("Search", variant="primary")
-        with gr.Row():
-            sources = gr.CheckboxGroup(engine.source_names, value=engine.source_names, label="Sources",
-                                       visible=multi_source)
-            device = gr.Radio(list(engines), value=CPU, label="Query encoding device",
-                              info="ZeroGPU latency includes GPU allocation (first call is slowest)",
-                              visible=len(engines) > 1)
-        gr.Examples(EXAMPLES, inputs=[query], label="Example queries")
+        with gr.Column(visible=True) as apps_examples:
+            gr.Examples([q for _, q in APPS_EXAMPLES], inputs=[query], label="Examples (APPS)",
+                        example_labels=[lbl for lbl, _ in APPS_EXAMPLES])
+        with gr.Column(visible=False) as repo_examples:
+            gr.Examples([q for _, q in REPO_EXAMPLES], inputs=[query],
+                        label=f"Examples ({repo.name if repo else 'repo'})",
+                        example_labels=[lbl for lbl, _ in REPO_EXAMPLES])
         status = gr.Markdown()
         outputs: list = [status]
         for _ in range(MAX_K):
@@ -177,12 +212,13 @@ def create_demo(engines: dict[str, SearchEngine] | SearchEngine) -> gr.Blocks:
                 code = gr.Code(language="python", interactive=False, show_label=False, max_lines=30)
             outputs += [group, header, code]
 
-        btn.click(run, [query, k, sources, device], outputs)
-        query.submit(run, [query, k, sources, device], outputs)
+        where.change(on_source, [where], [version, apps_examples, repo_examples])
+        btn.click(run, [query, k, where, version], outputs)
+        query.submit(run, [query, k, where, version], outputs)
     return demo
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    demo = create_demo(build_engines())
+    demo = create_demo(*build_state())
     demo.queue(default_concurrency_limit=2).launch(theme=gr.themes.Soft())

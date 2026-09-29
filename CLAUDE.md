@@ -68,7 +68,11 @@ retrieval/
   precompute_corpus.py  Kaggle GPU: embed the AppsRetrieval corpus → HF dataset madhurr382/apps-corpus-index
 space/                  HF Space madhurr382/code-search-demo (Gradio, CPU): app.py UI, search.py SearchSource/
                         DenseIndexSource/SearchEngine, query_encoder.py; see DEPLOY_SPACE.md (branch deploy-space)
-tests/                  unittest + fake embedder, no torch: `python -m unittest discover -s tests`
+  versioned/             P1 retrieval across versions: chunker (ast), store (registry + content/embedding
+                        caches keyed by normalised-code hash, copied to space/versioned_store.py), builder
+                        (full / git-diff incremental), searcher, CLI `python -m retrieval.versioned`,
+                        precompute_repo.py (Kaggle: psf/requests at 4 tags -> madhurr382/repo-versions-index)
+tests/                  pytest (+ unittest), fake embedders + throwaway git repo, no torch: `python -m pytest tests`
 seed_training_data.py   seeds SAST feedback rows                            [SAST — replace]
 requirements.txt        web app only (Render image); requirements-retrieval.txt = CPU torch + mteb + ST
 README.md, KAGGLE.md    submission write-up and Kaggle cells; old SAST README in docs/SAST_README.md
@@ -204,7 +208,10 @@ to reproduce the ablation table.
   (`WinError 4551 ... Application Control policy has blocked this file`, surfacing as
   `WinError 1114` on `c10.dll`). Local checks are limited to `py_compile` and static review.
   The FastAPI/SAST parts don't need torch.
-- **Branching:** work on `retrieval-baseline`; don't merge to `main` yet. Render auto-deploys `main`.
+- **Branching:** Phase 1 is merged to `main` (release v1.0). Space work is on `deploy-space`, Phase 2 on
+  `phase2-versions`; never push these to `main`: Render auto-deploys `main` to a friend's account.
+- **Space hardware:** `code-search-demo` is ZeroGPU and a free account can't downgrade it (HTTP 402). ZeroGPU
+  needs a `@spaces.GPU` function and rejects `+cpu` torch; the Phase 2 app is CPU only (see DEPLOY_SPACE.md).
 - `requirements.txt` has only the web app deps, so the Render image doesn't pull CUDA torch. Retrieval deps live in
   `requirements-retrieval.txt`, which pins `torch==2.14.0+cpu` from the PyTorch CPU index. On Kaggle don't install
   that file (it would replace the CUDA torch); `KAGGLE.md` pip-installs the other pins directly.

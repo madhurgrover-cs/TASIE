@@ -1,4 +1,4 @@
-"""Search logic of the Space with a fake embedder (no torch):  python -m unittest discover -s tests"""
+"""Search logic of the Space with a fake embedder (no torch):  python -m pytest tests"""
 from __future__ import annotations
 
 import hashlib
