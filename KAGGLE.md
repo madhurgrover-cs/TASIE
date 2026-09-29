@@ -6,6 +6,24 @@ Notebook settings: **Accelerator GPU T4** (x1 or x2; `finetune.py` pins one GPU)
 
 Run each block as its own cell, in order. Outputs go to `/kaggle/working/`.
 
+## 0. Hub-only eval (no training)
+
+Fresh notebook, **Internet on**. Use Accelerator **None** to match CPU screening, or a
+GPU with `--device cuda` for a faster check. This is one cell: everything runs in
+subprocesses, so it needs no restart after pip.
+
+```python
+!git clone -q -b retrieval-baseline https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
+%cd /kaggle/working/TASIE
+!pip install -q mteb==2.21.8 sentence-transformers==6.1.0 rank-bm25==0.2.2 einops==0.8.2
+!python retrieval/submission.py --model madhurr382/coderankembed-apps-ft --device cpu --out /kaggle/working/appsretrieval_results.json
+!python -c "import json; s=json.load(open('/kaggle/working/appsretrieval_results.json'))['scores']['test'][0]; print('NDCG@10', s['ndcg_at_10'], 'MRR@10', s['mrr_at_10'])"
+```
+
+Expected: NDCG@10 ≈ 0.4720, MRR@10 ≈ 0.4319. `load_st_model` passes
+`model_kwargs={"safe_serialization": True}` for NomicBert, so the Hub repo loads from
+`model.safetensors`.
+
 ## 1. Setup
 
 ```python
@@ -62,7 +80,21 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 
 ```python
 REPO_ID = "madhurr382/coderankembed-apps-ft"
-!python retrieval/push_model.py --model-dir /kaggle/working/cre-ft --repo-id {REPO_ID} --ndcg 0.4709 --mrr 0.4303
+!python retrieval/push_model.py --model-dir /kaggle/working/cre-ft --repo-id {REPO_ID} --ndcg 0.4720 --mrr 0.4319 --also-bin
+```
+
+`--also-bin` also uploads a `pytorch_model.bin` copy, so a plain
+`SentenceTransformer(REPO_ID, trust_remote_code=True)` works without the
+`safe_serialization` kwarg.
+
+If `/kaggle/working/cre-ft` is gone (new session), use this cell to re-push the card
+and add the `.bin` from the Hub copy:
+
+```python
+REPO_ID = "madhurr382/coderankembed-apps-ft"
+from huggingface_hub import snapshot_download
+snapshot_download(REPO_ID, local_dir="/kaggle/working/hub-copy")
+!python retrieval/push_model.py --model-dir /kaggle/working/hub-copy --repo-id {REPO_ID} --ndcg 0.4720 --mrr 0.4319 --also-bin
 ```
 
 Add `--private` to create a private repo. The evaluators need read access, so make

@@ -120,6 +120,11 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
   imports `find_pruneable_heads_and_indices` and calls `get_extended_attention_mask` /
   `get_head_mask` / `invert_attention_mask`, all removed in v5. It would need transformers<5, which
   conflicts with sentence-transformers 6.x.
+- **NomicBert Hub loading:** its remote `from_pretrained` loads a Hub id via
+  `state_dict_from_pretrained(safe_serialization=kwargs.get("safe_serialization", False))`, which only tries
+  `pytorch_model.bin(.index.json)`. Our Hub repo has only `model.safetensors`, so `load_st_model` passes
+  `model_kwargs["safe_serialization"]=True` when the config's `model_type == "nomic_bert"`. Local dirs take a separate
+  branch that ignores the flag. `push_model.py --also-bin` also uploads a `.bin` copy for plain loading.
 - Embeddings are L2-normalised, and similarity is cosine.
 - `--device auto|cuda|cpu` (default `auto` = CUDA if `torch.cuda.is_available()`). The resolved
   device is logged at startup and recorded in the results JSON. Screening is CPU, so use GPU for fast iteration only.
@@ -127,7 +132,7 @@ Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
 ### Results so far (full AppsRetrieval test split)
 
 **Final (Phase 1 submission):** fine-tuned CodeRankEmbed (finetune.py plain run, 2 epochs, no hard negatives) +
-desc-io, dense → NDCG@10 **0.4709**, MRR@10 **0.4303**. Hard negatives (3 epochs) scored worse on val
+desc-io, dense → NDCG@10 **0.4720**, MRR@10 **0.4319**. Hard negatives (3 epochs) scored worse on val
 (MRR@10 0.7266 vs 0.7503), so they are not used.
 
 | Preset | q_len / d_len | NDCG@10 | MRR@10 | Notes |

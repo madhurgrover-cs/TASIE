@@ -9,7 +9,7 @@ given a natural-language problem statement, rank the code snippets that solve it
 
 | | NDCG@10 | MRR@10 |
 |---|---|---|
-| **Final: fine-tuned CodeRankEmbed + `desc-io` query cleanup** | **0.4709** | **0.4303** |
+| **Final: fine-tuned CodeRankEmbed + `desc-io` query cleanup** | **0.4720** | **0.4319** |
 | Base CodeRankEmbed, raw queries | 0.2368 | 0.2073 |
 
 ## Problem
@@ -57,7 +57,7 @@ Full `AppsRetrieval` test split, CodeRankEmbed, query/doc max length 512.
 |---|---|---|---|---|
 | Base model | dense | raw | 0.2368 | 0.2073 |
 | + query cleanup | dense | `desc-io` | 0.2420 | — |
-| **+ fine-tuning (final)** | dense | `desc-io` | **0.4709** | **0.4303** |
+| **+ fine-tuning (final)** | dense | `desc-io` | **0.4720** | **0.4319** |
 
 Ablations that did not make it in:
 
@@ -99,7 +99,7 @@ python retrieval/finetune.py --output-dir /kaggle/working/cre-ft          # fina
 python retrieval/finetune.py --output-dir /kaggle/working/cre-ft-smoke --smoke   # pipeline check
 python retrieval/eval_baseline.py --model /kaggle/working/cre-ft          # eval a local dir
 HF_TOKEN=hf_... python retrieval/push_model.py --model-dir /kaggle/working/cre-ft \
-    --repo-id madhurr382/coderankembed-apps-ft --ndcg 0.4709 --mrr 0.4303   # publish
+    --repo-id madhurr382/coderankembed-apps-ft --ndcg 0.4720 --mrr 0.4319 --also-bin   # publish
 ```
 
 `finetune.py` writes the model plus `finetune_config.json` (base preset, run id,

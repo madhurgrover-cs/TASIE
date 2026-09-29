@@ -7,7 +7,7 @@ Samsung "Agentic Code Intelligence" screening submission: AppsRetrieval (CPU).
 
 Final model: nomic-ai/CodeRankEmbed fine-tuned on the APPS train split
 (retrieval/finetune.py, 2 epochs, CachedMNRL, no hard negatives), dense retrieval,
-cosine similarity. Full test split: NDCG@10 0.4709, MRR@10 0.4303.
+cosine similarity. Full test split: NDCG@10 0.4720, MRR@10 0.4319.
 
 PrePostPipelineEncoder does all pre/post-processing inside encode():
   pre  (queries) desc-io cleanup (retrieval/query_clean.py): keep the problem

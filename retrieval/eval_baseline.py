@@ -131,15 +131,32 @@ def restore_nonpersistent_buffers(st_model: SentenceTransformer) -> tuple[int, i
     return restored, differed
 
 
+def _is_nomic_bert(model_name: str, trust_remote_code: bool) -> bool:
+    try:
+        cfg = transformers.AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    except Exception as e:  # let SentenceTransformer raise the real loading error
+        logger.warning("Could not read config of %s: %s", model_name, e)
+        return False
+    return cfg.model_type == "nomic_bert"
+
+
 def load_st_model(model_name: str, device: str, trust_remote_code: bool = True) -> tuple[SentenceTransformer, dict[str, int]]:
-    """Load in fp32 and repair non-persistent buffers. Shared by eval and finetune.py."""
+    """Load in fp32 and repair non-persistent buffers. Shared by eval, submission and finetune.py."""
     # fp32: some checkpoints are stored in fp16/bf16, and transformers v5
     # would otherwise load them in that dtype (slow and lossy on CPU).
+    model_kwargs: dict[str, Any] = {"torch_dtype": torch.float32}
+    # NomicBert's remote from_pretrained loads Hub ids through
+    # state_dict_from_pretrained(safe_serialization=kwargs.get("safe_serialization", False)),
+    # which only looks for pytorch_model.bin(.index.json); our Hub repo (like
+    # nomic-ai/CodeRankEmbed) has only model.safetensors. Local dirs take a separate
+    # branch that ignores the flag. Other architectures may reject the kwarg, so gate it.
+    if _is_nomic_bert(model_name, trust_remote_code):
+        model_kwargs["safe_serialization"] = True
     model = SentenceTransformer(
         model_name,
         device=device,
         trust_remote_code=trust_remote_code,
-        model_kwargs={"torch_dtype": torch.float32},
+        model_kwargs=model_kwargs,
     )
     restored, differed = restore_nonpersistent_buffers(model)
     logger.info("Restored %d non-persistent buffers (%d had uninitialised values after load)",
