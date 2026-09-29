@@ -48,3 +48,9 @@ htmlcov/
 retrieval/cache/
 appsretrieval_results.smoke.json
 appsretrieval_results*_mteb/
+
+# Versioned index / precompute outputs
+versioned-index/
+versioned-work/
+repo-versions-index/
+apps-corpus-index/
