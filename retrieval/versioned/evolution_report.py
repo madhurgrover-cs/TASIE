@@ -43,6 +43,8 @@ def print_result(idx: AllVersionsIndex, res: AllVersionsResult, k: int) -> None:
         c = lin.representative.chunk
         shown = idx.versions[lin.representative.version].label
         note = "" if lin.representative_score == lin.best_score else f" (shown {lin.representative_score:.4f})"
+        if lin.penalty:
+            note += f" [rank {lin.rank_score:.4f}: -{lin.penalty:.2f} {c['kind']}]"
         print(f"  {i:>2}. {lin.best_score:.4f}{note}  {canonical_path(c['path'])}::{c['name']}  "
               f"[shown {shown}: {c['path']}:{c['start_line']}-{c['end_line']}]")
         print(f"      {lin.timeline_text()}   {'code changed' if lin.changed else 'code unchanged'}")
@@ -90,7 +92,7 @@ def main() -> None:
           f"reused from the store (no re-embedding) | index {time.perf_counter() - t0:.2f}s, "
           f"model {model_id} loaded in {load_s:.1f}s on {args.device}")
     print(f"ranking: one entry per lineage, prefer={args.prefer}, tie={args.tie}, near-dup cosine>{args.dup_threshold}"
-          f" | timeline: ● new/changed  ○ unchanged  – absent")
+          f", module/non-Python file penalty 0.05 | timeline: ● new/changed  ○ unchanged  – absent")
 
     totals = {"flat_duplicates": 0, "grouped_duplicates": 0, "flat_unique": 0, "grouped_unique": 0}
     rows = []

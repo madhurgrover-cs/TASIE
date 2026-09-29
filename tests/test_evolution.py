@@ -44,6 +44,8 @@ class TestHelpers:
     def test_canonical_path(self):
         assert canonical_path("src/requests/utils.py") == canonical_path("requests/utils.py") == "requests/utils.py"
         assert canonical_path("src") == "src" and canonical_path("tests/src/x.py") == "tests/src/x.py"
+        assert canonical_path("test_requests.py") == canonical_path("tests/test_requests.py") == "tests/test_requests.py"
+        assert canonical_path("setup.py") == "setup.py" and canonical_path("pkg/test_x.py") == "pkg/test_x.py"
 
     def test_identity_key(self):
         a = {"path": "src/pkg/core.py", "kind": "function", "name": "f", "hash": "h1"}
@@ -151,9 +153,15 @@ class FakeStore:
         return f"code {h}"
 
 
-def chunk(name, h, path="m.py", kind="function"):
-    return {"id": f"{path}#{name}@1", "path": path, "name": name, "kind": kind,
-            "start_line": 1, "end_line": 2, "hash": h}
+def chunk(name, h, path="m.py", kind="function", language="python", line=1):
+    return {"id": f"{path}#{name}@{line}", "path": path, "name": name, "kind": kind,
+            "start_line": line, "end_line": line + 1, "hash": h, "language": language}
+
+
+def at_cos(c):
+    """Two 2-D unit vectors with cosine c between them, both scoring ~0.99 against (1, 0)."""
+    t = np.arccos(c) / 2
+    return [np.cos(0.1 - t), np.sin(0.1 - t)], [np.cos(0.1 + t), np.sin(0.1 + t)]
 
 
 def unit(angle):
@@ -216,6 +224,60 @@ class TestRanking:
         paths = sorted(sorted({o.chunk["path"] for s in lin.timeline if s.occurrence for o in [s.occurrence]})
                        for lin in res.lineages)
         assert paths == [["a.py"], ["b.py"]]
+
+    def test_renamed_test_class_and_moved_test_file(self):
+        # v2.0.0 test_requests.py::RequestsTestCase.test_x -> tests/test_requests.py::TestRequests.test_x
+        a, b = at_cos(0.92)
+        store = FakeStore({"v1": [chunk("RequestsTestCase.test_x", "a", "test_requests.py", "method")],
+                           "v2": [chunk("TestRequests.test_x", "b", "tests/test_requests.py", "method")]},
+                          {"a": a, "b": b})
+        (lin,) = AllVersionsIndex(store).search(np.array([1.0, 0.0]), k=5).lineages
+        assert [s.state for s in lin.timeline] == [NEW, NEW]
+        # below rename_threshold (0.9): stays split
+        a, b = at_cos(0.85)
+        store.__init__(store._versions, {"a": a, "b": b})
+        assert len(AllVersionsIndex(store).search(np.array([1.0, 0.0]), k=5).lineages) == 2
+
+    def test_class_rename_needs_same_method_name_and_file(self):
+        a, b = at_cos(0.93)  # above 0.9, below 0.95
+        other_method = FakeStore({"v1": [chunk("Old.test_x", "a", "t.py", "method")],
+                                  "v2": [chunk("New.test_y", "b", "t.py", "method")]}, {"a": a, "b": b})
+        assert len(AllVersionsIndex(other_method).search(np.array([1.0, 0.0]), k=5).lineages) == 2
+        other_file = FakeStore({"v1": [chunk("Old.test_x", "a", "t.py", "method")],
+                                "v2": [chunk("New.test_x", "b", "u.py", "method")]}, {"a": a, "b": b})
+        assert len(AllVersionsIndex(other_file).search(np.array([1.0, 0.0]), k=5).lineages) == 2
+
+    def test_single_module_block_is_keyed_by_file(self):
+        # requests/auth.py: one <module> block per version, cosine only 0.86 between versions
+        a, b = at_cos(0.86)
+        store = FakeStore({"v1": [chunk("<module>", "a", "requests/auth.py", "module")],
+                           "v2": [chunk("<module>", "b", "src/requests/auth.py", "module", line=5)]},
+                          {"a": a, "b": b})
+        (lin,) = AllVersionsIndex(store).search(np.array([1.0, 0.0]), k=5).lineages
+        assert [s.state for s in lin.timeline] == [NEW, NEW]
+        # two blocks in the file: content keys, merged within the file only above 0.9
+        a2, b2 = at_cos(0.86)
+        multi = FakeStore({"v1": [chunk("<module>", "a", "x.py", "module"), chunk("<module>", "z", "x.py", "module", line=9)],
+                           "v2": [chunk("<module>", "b", "x.py", "module")]},
+                          {"a": a2, "b": b2, "z": [0.0, 1.0]})
+        assert len(AllVersionsIndex(multi).search(np.array([1.0, 0.0]), k=5).lineages) == 3
+
+    def test_module_and_non_python_files_rank_below_functions(self):
+        store = FakeStore({"v1": [chunk("<module>", "m", "a.py", "module"),
+                                  chunk("README.md", "r", "README.md", "file", "markdown"),
+                                  chunk("legacy.py", "l", "legacy.py", "file", "python"),
+                                  chunk("f", "f", "b.py")]},
+                          {"m": unit(np.arccos(0.80)), "r": unit(np.arccos(0.79)),
+                           "l": unit(np.arccos(0.77)), "f": unit(np.arccos(0.76))})
+        idx = AllVersionsIndex(store)
+        q = np.array([1.0, 0.0])
+        ranked = idx.search(q, k=4).lineages
+        # module 0.80-0.05=0.75, README 0.79-0.05=0.74; py2 file-level chunk is Python: no penalty
+        assert [lin.representative.chunk["name"] for lin in ranked] == ["legacy.py", "f", "<module>", "README.md"]
+        assert [lin.penalty for lin in ranked] == [0.0, 0.0, 0.05, 0.05]
+        assert ranked[2].best_score == pytest.approx(0.80) and ranked[2].rank_score == pytest.approx(0.75)
+        raw = idx.search(q, k=4, kind_penalty=0.0).lineages
+        assert [lin.representative.chunk["name"] for lin in raw] == ["<module>", "README.md", "legacy.py", "f"]
 
     def test_equal_best_scores_newest_first(self):
         store = FakeStore({"v1": [chunk("old", "a", "a.py")], "v2": [chunk("new", "b", "b.py")]},
