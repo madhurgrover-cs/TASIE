@@ -1,0 +1,12 @@
+# Installed by the Gradio SDK Space on top of gradio==<sdk_version> (README.md header).
+# Model stack pinned to what trained and evaluated the model on Kaggle
+# (config_sentence_transformers.json on madhurr382/coderankembed-apps-ft:
+#  pytorch 2.10.0, transformers 5.0.0, sentence-transformers 6.1.0).
+# CPU-only torch wheel: the Space runs on CPU basic.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.10.0+cpu
+transformers==5.0.0
+sentence-transformers==6.1.0
+einops==0.8.2  # nomic-ai/CodeRankEmbed remote code
+numpy
+huggingface_hub

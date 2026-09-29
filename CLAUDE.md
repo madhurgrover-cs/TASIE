@@ -64,6 +64,11 @@ retrieval/
   submission.py         screening submission: PrePostPipelineEncoder, loads the fine-tuned model from the HF Hub
   push_model.py         upload a finetune.py output dir + model card to the HF Hub (HF_TOKEN)
   cache/                corpus embedding cache (gitignored)
+  model_loading.py      load_st_model (fp32, NomicBert safe_serialization, buffer fix); copied verbatim to space/
+  precompute_corpus.py  Kaggle GPU: embed the AppsRetrieval corpus → HF dataset madhurr382/apps-corpus-index
+space/                  HF Space madhurr382/code-search-demo (Gradio, CPU): app.py UI, search.py SearchSource/
+                        DenseIndexSource/SearchEngine, query_encoder.py; see DEPLOY_SPACE.md (branch deploy-space)
+tests/                  unittest + fake embedder, no torch: `python -m unittest discover -s tests`
 seed_training_data.py   seeds SAST feedback rows                            [SAST — replace]
 requirements.txt        web app only (Render image); requirements-retrieval.txt = CPU torch + mteb + ST
 README.md, KAGGLE.md    submission write-up and Kaggle cells; old SAST README in docs/SAST_README.md
