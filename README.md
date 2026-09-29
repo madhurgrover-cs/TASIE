@@ -137,6 +137,22 @@ rebuilds the published index and benchmark (see [DEPLOY_SPACE.md](DEPLOY_SPACE.m
 The tests run without torch, using fake embedders and a throwaway git repo:
 `pip install -r requirements-dev.txt && python -m pytest tests`.
 
+## Bonus: evolutionary retrieval (branch `bonus-evolution`, experimental, not deployed)
+
+`retrieval/versioned/evolution.py` searches **all** indexed versions at once and returns one entry
+per *lineage*: the same canonical path + qualified name across versions (`requests/` and
+`src/requests/` count as one path), plus near-duplicates (cosine > 0.95) that were moved
+(same name) or renamed (same file). Code that coexists in one version is never merged.
+Each lineage shows one version (by default the latest within 0.01 of its best score) and a
+timeline, e.g. `v2.0.0 ● v2.12.0 ● v2.25.0 ● v2.32.3 ○` (● new/changed by content hash,
+○ unchanged, – absent). It reuses the stored vectors: each distinct chunk is scored once and
+nothing is re-embedded.
+
+Verification on the published index, using stored chunk vectors as stand-in queries (no model
+needed): without grouping, about 5 of the top 10 results (up to 7) repeat a function already
+listed; with grouping, 0. `python -m retrieval.versioned.evolution_report` measures this with
+real text queries (see [DEPLOY_SPACE.md](DEPLOY_SPACE.md) section (d)).
+
 ## Reproduce
 
 ### Evaluate the submission on CPU

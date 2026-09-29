@@ -288,6 +288,9 @@ class TestCLI:
         assert "pkg/retry.py:1-3" in out and "backoff_delay" in out and " ms" in out
         assert cli(base + ["query", "--commit", "v3", "--json", "cookies"]) == 0
         payload = json.loads(capsys.readouterr().out)
+        assert cli(base + ["query", "--commit", "all", "-k", "3", "exponential backoff retry"]) == 0
+        out = capsys.readouterr().out
+        assert "lineages" in out and "backoff_delay" in out and "duplicates in top 10" in out
         assert payload["hits"] and {"path", "name", "start_line", "end_line", "score"} <= set(payload["hits"][0])
 
 

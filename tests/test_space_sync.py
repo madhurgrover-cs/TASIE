@@ -10,6 +10,7 @@ COPIED = {
     "query_clean.py": "query_clean.py",
     "model_loading.py": "model_loading.py",
     "versioned_store.py": "versioned/store.py",
+    "versioned_evolution.py": "versioned/evolution.py",
 }
 
 

@@ -69,6 +69,8 @@ SESSION_BLOCK = CORE_V2[CORE_V2.index("class Session:"):CORE_V2.index("async def
 # v3: Session moves, unchanged, into its own module
 CORE_V3 = CORE_V2.replace(SESSION_BLOCK, "")
 SESSION_V3 = '"""Session object."""\nfrom pkg.core import parse_header\n\n\n' + SESSION_BLOCK.rstrip() + "\n"
+# v4: pkg/ -> src/pkg/ (like requests/ -> src/requests/), and fetch_json changes
+CORE_V4 = CORE_V3.replace('    return {"url": url}', '    return {"url": url, "ok": True}')
 
 
 def _git(repo: Path, *args: str, date: str | None = None) -> str:
@@ -113,5 +115,12 @@ def git_repo(tmp_path_factory) -> dict:
     _git(repo, "commit", "-q", "-m", "v3", date="2022-01-01T00:00:00+00:00")
     _git(repo, "tag", "v3")
 
-    shas = {t: _git(repo, "rev-parse", f"{t}^{{commit}}") for t in ("v1", "v2", "v3")}
+    (repo / "src").mkdir()
+    _git(repo, "mv", "pkg", "src/pkg")
+    _write(repo, "src/pkg/core.py", CORE_V4)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "v4", date="2023-01-01T00:00:00+00:00")
+    _git(repo, "tag", "v4")
+
+    shas = {t: _git(repo, "rev-parse", f"{t}^{{commit}}") for t in ("v1", "v2", "v3", "v4")}
     return {"path": repo, "shas": shas}

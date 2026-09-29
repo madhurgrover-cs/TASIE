@@ -72,6 +72,8 @@ space/                  HF Space madhurr382/code-search-demo (Gradio, CPU): app.
                         caches keyed by normalised-code hash, copied to space/versioned_store.py), builder
                         (full / git-diff incremental), searcher, CLI `python -m retrieval.versioned`,
                         precompute_repo.py (Kaggle: psf/requests at 4 tags -> madhurr382/repo-versions-index)
+                        evolution.py (bonus, branch bonus-evolution): all-versions search grouped into lineages,
+                        copied to space/versioned_evolution.py; evolution_report.py = Kaggle verification
 tests/                  pytest (+ unittest), fake embedders + throwaway git repo, no torch: `python -m pytest tests`
 seed_training_data.py   seeds SAST feedback rows                            [SAST — replace]
 requirements.txt        web app only (Render image); requirements-retrieval.txt = CPU torch + mteb + ST

@@ -10,6 +10,7 @@ Examples:
     python -m retrieval.versioned index  --repo ../requests --commit v2.0.0
     python -m retrieval.versioned update --repo ../requests --commit v2.12.0
     python -m retrieval.versioned query  --commit v2.12.0 "retry a request after a redirect" -k 5
+    python -m retrieval.versioned query  --commit all "retry a request after a redirect"   # every version, grouped
     python -m retrieval.versioned list-versions
     ... --embedder hashing   (no torch; for dry runs)
 
@@ -86,7 +87,8 @@ def main(argv: list[str] | None = None) -> int:
 
     q = sub.add_parser("query")
     q.add_argument("text")
-    q.add_argument("--commit", required=True)
+    q.add_argument("--commit", required=True, help='sha / tag, or "all" for every version grouped by lineage')
+    q.add_argument("--prefer", choices=["latest", "score"], default="latest", help="--commit all: version shown")
     q.add_argument("-k", type=int, default=5)
     q.add_argument("--json", action="store_true")
     q.add_argument("--show-code", type=int, default=0, metavar="LINES", help="print the first LINES of each hit")
@@ -112,6 +114,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     embedder = make_embedder(args, store)
+    if args.commit == "all":
+        from retrieval.versioned.evolution import AllVersionsIndex
+        from retrieval.versioned.evolution_report import print_result
+
+        idx = AllVersionsIndex(store)
+        print_result(idx, idx.search(embedder.embed_query(args.text), args.k, prefer=args.prefer), args.k)
+        return 0
     res = VersionedSearcher(store, embedder).search(args.text, args.commit, args.k)
     if args.json:
         print(json.dumps({"commit": res.commit, "label": res.label, "encode_ms": res.encode_ms,

@@ -39,10 +39,47 @@ class VersionedRepoSource(SearchSource):
         ]
 
 
-def load_repo_sources(root: str | Path) -> tuple[Store, list[VersionedRepoSource]]:
-    """All indexed commits of a store, oldest first."""
+class AllVersionsRepoSource(SearchSource):
+    """Every indexed commit at once: one hit per lineage (versioned_evolution.py)."""
+
+    def __init__(self, store: Store, repo: str, prefer: str = "latest"):
+        from versioned_evolution import AllVersionsIndex
+
+        self.index = AllVersionsIndex(store)
+        self.repo = repo
+        self.prefer = prefer
+        self.name = f"{repo}@all"
+        self.label = "All versions"
+
+    def __len__(self) -> int:
+        return len(self.index)  # distinct chunks over all versions
+
+    def search(self, query: EncodedQuery, k: int) -> list[Hit]:
+        hits = []
+        for lin in self.index.search(query.vector, k, prefer=self.prefer).lineages:
+            o = lin.representative
+            c = o.chunk
+            version = self.index.versions[o.version]
+            url = None
+            if self.repo.count("/") == 1:
+                url = f"https://github.com/{self.repo}/blob/{version.commit}/{c['path']}#L{c['start_line']}-L{c['end_line']}"
+            hits.append(Hit(
+                source=self.name, doc_id=f"lineage:{c['id']}", score=lin.best_score, code=self.index.code(o),
+                language=c.get("language", "text"), url=url,
+                meta={"path": c["path"], "name": c["name"], "kind": c["kind"], "start_line": c["start_line"],
+                      "end_line": c["end_line"], "commit": version.commit, "version": version.label,
+                      "timeline": lin.timeline_text(), "versions_present": lin.versions_present,
+                      "changed": lin.changed, "shown_score": lin.representative_score}))
+        return hits
+
+
+def load_repo_sources(root: str | Path, all_versions: bool = False) -> tuple[Store, list[SearchSource]]:
+    """All indexed commits of a store, oldest first; plus an AllVersionsRepoSource last if asked."""
     store = Store(root)
-    sources = [VersionedRepoSource(store.load_view(v["commit"]), store.registry.repo or "repo",
-                                   store.registry.label(v["commit"]))
-               for v in store.registry.list()]
+    repo = store.registry.repo or "repo"
+    sources: list[SearchSource] = [VersionedRepoSource(store.load_view(v["commit"]), repo,
+                                                       store.registry.label(v["commit"]))
+                                   for v in store.registry.list()]
+    if all_versions:
+        sources.append(AllVersionsRepoSource(store, repo))
     return store, sources

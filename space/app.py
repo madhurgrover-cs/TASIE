@@ -89,7 +89,8 @@ CODE_LANGUAGES = {"python", "c", "cpp", "markdown", "json", "html", "css", "java
 @dataclass
 class RepoInfo:
     name: str  # e.g. "psf/requests"
-    versions: list[tuple[str, str]] = field(default_factory=list)  # (dropdown label, source name), newest first
+    versions: list[tuple[str, str]] = field(default_factory=list)  # (dropdown label, source name)
+    default: str | None = None  # dropdown value on load: the newest commit
 
     @property
     def choice(self) -> str:
@@ -145,7 +146,8 @@ def load_repo(dataset: str, revision: str | None, expected_model_id: str):
 
     from versioned_source import load_repo_sources
 
-    store, sources = load_repo_sources(snapshot_download(dataset, repo_type="dataset", revision=revision))
+    store, sources = load_repo_sources(snapshot_download(dataset, repo_type="dataset", revision=revision),
+                                       all_versions=True)
     if store.model_id != expected_model_id:
         raise RuntimeError(f"{dataset} was embedded with {store.model_id!r}, queries use {expected_model_id!r}; "
                            "rebuild it with the same model revision")
@@ -153,8 +155,12 @@ def load_repo(dataset: str, revision: str | None, expected_model_id: str):
 
 
 def repo_info(name: str, sources) -> RepoInfo:
-    """Dropdown entries, newest commit first (sources come oldest first)."""
-    return RepoInfo(name, [(s.label, s.name) for s in reversed(sources)])
+    """Dropdown entries: "All versions" (if loaded) first, then commits newest first.
+    `sources` are the commit sources oldest first, optionally followed by the all-versions source."""
+    commits = [s for s in sources if not s.name.endswith("@all")]
+    everything = [s for s in sources if s.name.endswith("@all")]
+    entries = [(s.label, s.name) for s in everything] + [(s.label, s.name) for s in reversed(commits)]
+    return RepoInfo(name, entries, commits[-1].label if commits else None)
 
 
 # ---- rendering
@@ -166,6 +172,12 @@ def _hit_header(rank: int, hit: Hit) -> str:
         parts += [f"`{meta['path']}`", f"**`{meta['name']}`** ({meta['kind']})", f"L{s}–{e}" if e != s else f"L{s}"]
         if hit.url:
             parts.append(f"[GitHub](<{hit.url}>)")
+        if "timeline" in meta:  # all-versions lineage: shown version + history
+            shown = f"shown: {meta['version']}"
+            if abs(meta["shown_score"] - hit.score) > 1e-9:
+                shown += f" ({meta['shown_score']:.4f}; best {hit.score:.4f} is within the 0.01 tie)"
+            return " · ".join(parts) + f"  \n`{meta['timeline']}` · {shown}" + \
+                (" · code changed" if meta["changed"] else " · code unchanged")
     else:  # APPS solution
         parts.append(f"id `{hit.doc_id}`")
         if meta.get("partition"):
@@ -207,6 +219,9 @@ def create_demo(engine: SearchEngine, repo: RepoInfo | None = None,
             if version not in versions:
                 return _empty("⚠️ pick a commit")
             source, scope = versions[version], f" of {repo.name} @ {version}"
+            if source.endswith("@all"):
+                scope = (f" of {repo.name}, all versions, one result per function history "
+                         f"(● new/changed · ○ unchanged · – absent)")
         else:
             source, scope = APPS, ""
         try:
@@ -233,7 +248,9 @@ def create_demo(engine: SearchEngine, repo: RepoInfo | None = None,
         with gr.Row():
             where = gr.Radio(choices, value=APPS, label="Search in", visible=len(choices) > 1, scale=2)
             version = gr.Dropdown([label for label, _ in repo.versions] if repo else [],
-                                  value=repo.versions[0][0] if repo and repo.versions else None,
+                                  value=(repo.default or next((lbl for lbl, name in repo.versions
+                                                               if not name.endswith("@all")), None))
+                                  if repo else None,
                                   label="Commit", visible=False, scale=2)
         with gr.Row():
             query = gr.Textbox(label="Query", placeholder="e.g. find the longest increasing subsequence",

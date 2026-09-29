@@ -137,6 +137,28 @@ Both indexes and the model are public, so the Space needs no secrets. Optional v
 (*Settings → Variables*): `INDEX_REPO`, `INDEX_REVISION`, `REPO_INDEX` (set to empty to
 disable the repo source), `REPO_INDEX_REVISION`, `MODEL_ID`.
 
+## (d) Bonus: evolutionary retrieval (branch `bonus-evolution`, NOT deployed)
+
+Search every indexed version at once, with one result per function history ("lineage").
+Nothing is re-embedded: the uploaded `madhurr382/repo-versions-index` is reused, and only
+queries are encoded. The UI adds "All versions" to the commit dropdown, but this branch
+has **not** been uploaded to the Space. Verify on Kaggle first. CPU is fine, and no token
+is needed because the index and model are public:
+
+```python
+!git clone -q -b bonus-evolution https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
+%cd /kaggle/working/TASIE
+!pip install -q transformers==5.0.0 sentence-transformers==6.1.0 einops==0.8.2
+!python -m retrieval.versioned.evolution_report --device cpu
+```
+
+It prints, for 5 queries, the grouped top 10: best score, `path::name`, the version shown,
+and a timeline `v2.0.0 ● v2.12.0 ● v2.25.0 ○ v2.32.3 ●` (● new/changed, ○ unchanged,
+– absent). It also prints the ungrouped top 10 and a duplicate-metric table (top-10
+results repeating a function already listed, flat vs grouped). Options: `--prefer score`,
+`--tie 0.01`, `--dup-threshold 0.95`, `-k`, `--queries ...`. The CLI equivalent is
+`python -m retrieval.versioned --store DIR query --commit all "..."`.
+
 ## Troubleshooting
 
 - **`No @spaces.GPU function detected during startup`**: `SPACES_ZERO_GPU` wasn't seen at import
