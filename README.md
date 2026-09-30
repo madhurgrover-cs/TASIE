@@ -169,7 +169,7 @@ rebuilds the published index and benchmark (see [DEPLOY_SPACE.md](DEPLOY_SPACE.m
 The tests run without torch, using fake embedders and a throwaway git repo:
 `pip install -r requirements-dev.txt && python -m pytest tests`.
 
-## Bonus: evolutionary retrieval (branch `bonus-evolution`, experimental, not deployed)
+## Bonus: evolutionary retrieval (live on the demo: Commit → "All versions")
 
 `retrieval/versioned/evolution.py` searches **all** indexed versions at once and returns one entry
 per *lineage*: the same canonical path + qualified name across versions (`requests/` and

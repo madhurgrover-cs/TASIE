@@ -1,8 +1,7 @@
 # Deploying the code-search Space
 
 Space: [`madhurr382/code-search-demo`](https://huggingface.co/spaces/madhurr382/code-search-demo)
-(Gradio SDK 6.29.0). Source: `space/` on branch `phase2-versions` (Phase 1 version: `deploy-space`).
-Never merge these branches to `main`, because `main` auto-deploys to Render.
+(Gradio SDK 6.29.0). Source: `space/` on branch `main`.
 
 ```
 Kaggle GPU:  retrieval/precompute_corpus.py ───────────► dataset madhurr382/apps-corpus-index
@@ -33,7 +32,7 @@ Already done (`madhurr382/apps-corpus-index`, commit `dc58cbf`, model revision
 `c9f6787afd037f4981130ce48335723ed7e65057`). To rebuild: GPU T4, Internet on, secret `HF_TOKEN`.
 
 ```python
-!git clone -q -b phase2-versions https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
+!git clone -q -b main https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
 %cd /kaggle/working/TASIE
 # Kaggle's CUDA torch (2.10) stays; pin the rest to the versions the model was trained with.
 !pip install -q transformers==5.0.0 sentence-transformers==6.1.0 einops==0.8.2
@@ -61,7 +60,7 @@ then uploads to `madhurr382/repo-versions-index`.
 Notebook: **GPU T4**, **Internet on**, secret **`HF_TOKEN`** (write). One cell:
 
 ```python
-!git clone -q -b phase2-versions https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
+!git clone -q -b main https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
 %cd /kaggle/working/TASIE
 !pip install -q transformers==5.0.0 sentence-transformers==6.1.0 einops==0.8.2
 import os
@@ -116,7 +115,7 @@ From the repo root on the laptop. Nothing here needs torch.
    once with a write token: `hf auth login`. Check it with `hf auth whoami`.
 2. Get the branch and run the tests. Use `pip install -r requirements-dev.txt` once, for pytest:
    ```powershell
-   git checkout phase2-versions; git pull
+   git checkout main; git pull
    python -m pytest tests -q
    ```
 3. Check that (b) finished and that the repo index uses the right model:
@@ -137,16 +136,16 @@ Both indexes and the model are public, so the Space needs no secrets. Optional v
 (*Settings → Variables*): `INDEX_REPO`, `INDEX_REVISION`, `REPO_INDEX` (set to empty to
 disable the repo source), `REPO_INDEX_REVISION`, `MODEL_ID`.
 
-## (d) Bonus: evolutionary retrieval (branch `bonus-evolution`, NOT deployed)
+## (d) Bonus: evolutionary retrieval (live on the Space)
 
 Search every indexed version at once, with one result per function history ("lineage").
 Nothing is re-embedded: the uploaded `madhurr382/repo-versions-index` is reused, and only
-queries are encoded. The UI adds "All versions" to the commit dropdown, but this branch
-has **not** been uploaded to the Space. Verify on Kaggle first. CPU is fine, and no token
-is needed because the index and model are public:
+queries are encoded. The UI adds "All versions" to the Commit dropdown, and it is uploaded to
+the Space with the rest of `space/`. To verify it on Kaggle with the real model (CPU is fine,
+and no token is needed because the index and model are public):
 
 ```python
-!git clone -q -b bonus-evolution https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
+!git clone -q -b main https://github.com/madhurgrover-cs/TASIE.git /kaggle/working/TASIE
 %cd /kaggle/working/TASIE
 !pip install -q transformers==5.0.0 sentence-transformers==6.1.0 einops==0.8.2
 !python -m retrieval.versioned.evolution_report --device cpu

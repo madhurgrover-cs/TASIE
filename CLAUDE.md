@@ -49,12 +49,12 @@ retrieval/
   model_loading.py      load_st_model (fp32, NomicBert safe_serialization, buffer fix); copied verbatim to space/
   precompute_corpus.py  Kaggle GPU: embed the AppsRetrieval corpus → HF dataset madhurr382/apps-corpus-index
 space/                  HF Space madhurr382/code-search-demo (Gradio, CPU): app.py UI, search.py SearchSource/
-                        DenseIndexSource/SearchEngine, query_encoder.py; see DEPLOY_SPACE.md (branch deploy-space)
+                        DenseIndexSource/SearchEngine, query_encoder.py; see DEPLOY_SPACE.md (source on main)
   versioned/             P1 retrieval across versions: chunker (ast), store (registry + content/embedding
                         caches keyed by normalised-code hash, copied to space/versioned_store.py), builder
                         (full / git-diff incremental), searcher, CLI `python -m retrieval.versioned`,
                         precompute_repo.py (Kaggle: psf/requests at 4 tags -> madhurr382/repo-versions-index)
-                        evolution.py (bonus, branch bonus-evolution): all-versions search grouped into lineages,
+                        evolution.py (bonus, live on the Space): all-versions search grouped into lineages,
                         copied to space/versioned_evolution.py; evolution_report.py = Kaggle verification
 tests/                  pytest (+ unittest), fake embedders + throwaway git repo, no torch: `python -m pytest tests`
 requirements.txt        `-r requirements-retrieval.txt`; requirements-retrieval.txt = CPU torch + mteb + ST
@@ -180,8 +180,8 @@ to reproduce the ablation table.
   (`WinError 4551 ... Application Control policy has blocked this file`, surfacing as
   `WinError 1114` on `c10.dll`). Local checks are limited to `py_compile` and static review.
 - **Branching:** `main` is the submission branch (PRISM GenAI Hackathon final: Phase 1, P1 versions, bonus
-  lineage grouping, slides and AI disclosure). Space work is on `deploy-space`; `phase2-versions` and
-  `bonus-evolution` are merged into `main`.
+  lineage grouping, slides and AI disclosure). The Space is uploaded from `space/` on `main`;
+  `phase2-versions` and `bonus-evolution` are merged into `main`.
 - **Space hardware:** `code-search-demo` stays on ZeroGPU (user's decision; a free account can't downgrade it
   anyway, HTTP 402). ZeroGPU needs a `@spaces.GPU` function and rejects `+cpu` torch, so the app keeps a
   "GPU (optional)" encode path with CPU as the default, and pins `torch==2.10.0`. Don't create a new Space.
