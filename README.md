@@ -12,7 +12,8 @@
 | Indexes | [apps-corpus-index](https://huggingface.co/datasets/madhurr382/apps-corpus-index) · [repo-versions-index](https://huggingface.co/datasets/madhurr382/repo-versions-index) |
 | AI disclosure | [LangAI3_0_AI_Disclosure_ToothpasteEaters.docx](LangAI3_0_AI_Disclosure_ToothpasteEaters.docx) |
 
-> **What to review:** `retrieval/` (P0 model + P1 versioned index), `space/` (demo), `tests/`.
+> **What to review:** `retrieval/` (P0 model, P1 versioned index, Bonus lineage grouping in
+> `retrieval/versioned/evolution.py`), `space/` (demo), `tests/`.
 
 ### Setup (no Docker needed)
 Everything runs with plain Python on CPU:
@@ -22,23 +23,22 @@ python retrieval/submission.py        # reproduces appsretrieval_results.json
 python -m pytest tests                # runs without torch
 ```
 
-### Results at a glance
+### Results at a glance: all three goals done
 
-| | Result |
-|---|---|
-| P0: AppsRetrieval NDCG@10 (CPU) | **0.4720** (base CodeRankEmbed 0.2368, about 2×) |
-| P0: query latency (CPU) | ~28 ms (27 ms encode + 0.4 ms search over 8,765 snippets) |
-| P1: rebuild after a small release | **45× faster** (6 of 773 chunks re-embedded) |
-| P1: 4 versions, 2013–2024 | 28% less embedding work; same query finds the moved function at every version |
-
+| Goal | Status | Result |
+|---|---|---|
+| [**P0: AppsRetrieval accuracy**](#p0-appsretrieval) (CPU) | **Done** | NDCG@10 **0.4720**, MRR@10 **0.4319** (base CodeRankEmbed 0.2368 / 0.2073, about 2×); ~28 ms per query on CPU |
+| [**P1: retrieval across versions**](#p1-retrieval-across-versions) | **Done, live on the demo** | rebuild after a small release **45× faster** (6 of 773 chunks re-embedded); 4 versions 2013–2024 with 28% less embedding work |
+| [**Bonus: evolutionary retrieval**](#bonus-evolutionary-retrieval) | **Done, live on the demo** | all versions searched at once, one result per function lineage: repeated functions in the top 10 drop from 6.0 to **0** |
 
 Submission for Samsung's **Agentic Code Intelligence** hackathon: given a natural-language
 query, rank the code snippets that answer it. **P0** is the screening benchmark (MTEB
 `AppsRetrieval`, CPU); **P1** is retrieval across versions of a codebase, with fast
-incremental re-indexing.
+incremental re-indexing; the **Bonus** searches every indexed version at once and groups
+results by function history.
 
-**Live demo:** https://huggingface.co/spaces/madhurr382/code-search-demo (APPS corpus and
-psf/requests at 4 commits) ·
+**Live demo:** https://huggingface.co/spaces/madhurr382/code-search-demo (APPS corpus, and
+psf/requests at 4 commits or "All versions") ·
 **Model:** [`madhurr382/coderankembed-apps-ft`](https://huggingface.co/madhurr382/coderankembed-apps-ft) ·
 **Indexes:** [`madhurr382/apps-corpus-index`](https://huggingface.co/datasets/madhurr382/apps-corpus-index),
 [`madhurr382/repo-versions-index`](https://huggingface.co/datasets/madhurr382/repo-versions-index)
@@ -139,7 +139,7 @@ Kaggle T4 GPU (from `registry.json` / `benchmark.json` in
 Across the 4 indexed versions (v2.0.0 2013, v2.12.0 2016, v2.25.0 2020, v2.32.3 2024):
 3,444 chunk rows, but only 2,478 distinct chunks embedded and stored, so **28% of the embedding
 work is saved** (52.8 s total build time vs 74.5 s for four cold full builds). The tags are years
-apart (83–100% of files changed), so the adjacent-release rows show the everyday case.
+apart (85–96% of files changed), so the adjacent-release rows show the everyday case.
 
 The same query at each version, "get proxy settings from environment variables", top result:
 
@@ -169,21 +169,35 @@ rebuilds the published index and benchmark (see [DEPLOY_SPACE.md](DEPLOY_SPACE.m
 The tests run without torch, using fake embedders and a throwaway git repo:
 `pip install -r requirements-dev.txt && python -m pytest tests`.
 
-## Bonus: evolutionary retrieval (live on the demo: Commit → "All versions")
+## Bonus: evolutionary retrieval
 
-`retrieval/versioned/evolution.py` searches **all** indexed versions at once and returns one entry
-per *lineage*: the same canonical path + qualified name across versions (`requests/` and
-`src/requests/` count as one path), plus near-duplicates (cosine > 0.95) that were moved
-(same name) or renamed (same file). Code that coexists in one version is never merged.
-Each lineage shows one version (by default the latest within 0.01 of its best score) and a
-timeline, e.g. `v2.0.0 ● v2.12.0 ● v2.25.0 ● v2.32.3 ○` (● new/changed by content hash,
-○ unchanged, – absent). It reuses the stored vectors: each distinct chunk is scored once and
-nothing is re-embedded.
+**Deployed on the live demo.** Open the [Space](https://huggingface.co/spaces/madhurr382/code-search-demo),
+choose **psf/requests (git repo)**, then Commit → **All versions**.
 
-Verification on the published index, using stored chunk vectors as stand-in queries (no model
-needed): without grouping, about 5 of the top 10 results (up to 7) repeat a function already
-listed; with grouping, 0. `python -m retrieval.versioned.evolution_report` measures this with
-real text queries (see [DEPLOY_SPACE.md](DEPLOY_SPACE.md) section (d)).
+[`retrieval/versioned/evolution.py`](retrieval/versioned/evolution.py) searches **all** indexed
+versions at once and returns one result per *lineage* (function history): the same canonical
+path + qualified name across versions (`requests/` and `src/requests/` count as one path), plus
+near-duplicates (cosine > 0.95) that were moved (same name) or renamed (same file). Code that
+coexists in one version is never merged. Each lineage shows one version (by default the latest
+within 0.01 of its best score) and a timeline: ● new/changed (by content hash), ○ unchanged,
+– absent. For "get proxy settings from environment variables" the top result is:
+
+```
+src/requests/utils.py · get_environ_proxies   v2.0.0 ● v2.12.0 ● v2.25.0 ● v2.32.3 ○   shown: v2.32.3
+```
+
+Without grouping, the same function comes back once per version it exists in. Measured with
+`python -m retrieval.versioned.evolution_report --device cpu` (real model, published index,
+5 queries):
+
+| Top 10, mean over 5 queries | Flat (all versions, no grouping) | Grouped by lineage |
+|---|---|---|
+| Results repeating a function already listed | 6.0 / 10 | **0 / 10** |
+| Unique functions | 4.0 | **10.0** |
+
+Search + grouping takes 7–12 ms per query on CPU once the query is encoded. Nothing is
+re-embedded: the 2,478 distinct chunk vectors already stored for P1 are each scored once.
+To rerun the check on Kaggle, see [DEPLOY_SPACE.md](DEPLOY_SPACE.md) section (d).
 
 ## Reproduce
 
@@ -230,7 +244,8 @@ python retrieval/eval_baseline.py --retriever dense bm25 hybrid     # BM25 / hyb
 ```
 retrieval/
   submission.py      PrePostPipelineEncoder + AppsRetrieval eval → appsretrieval_results.json
-  versioned/         P1: chunker, content-hash cache, store/registry, builder, searcher, CLI
+  versioned/         P1: chunker, content-hash cache, store/registry, builder, searcher, CLI;
+                     Bonus: evolution.py (all-versions search grouped into lineages)
   precompute_corpus.py   APPS corpus index for the Space
   model_loading.py   load_st_model: fp32, NomicBert Hub loading, transformers v5 buffer fix
   finetune.py        CodeRankEmbed fine-tuning on APPS train
@@ -238,7 +253,7 @@ retrieval/
   eval_baseline.py   research harness: presets, embedding cache, ablation grid
   query_clean.py     APPS statement cleanup (pure Python)
   bm25_search.py     BM25 baseline as an mteb SearchProtocol model
-space/                       Hugging Face Space (Gradio): APPS + versioned repo search, see DEPLOY_SPACE.md
+space/                       Hugging Face Space (Gradio): APPS + versioned repo search + All versions, see DEPLOY_SPACE.md
 tests/                       pytest, no torch needed
 requirements-retrieval.txt   retrieval deps (CPU torch)
 requirements.txt             same as requirements-retrieval.txt (installs the retrieval project)
