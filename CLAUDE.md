@@ -179,8 +179,9 @@ to reproduce the ablation table.
   Windows Smart App Control blocks torch's unsigned DLLs there
   (`WinError 4551 ... Application Control policy has blocked this file`, surfacing as
   `WinError 1114` on `c10.dll`). Local checks are limited to `py_compile` and static review.
-- **Branching:** Phase 1 is merged to `main` (release v1.0). Space work is on `deploy-space`, Phase 2 on
-  `phase2-versions`; never push these to `main`.
+- **Branching:** `main` is the submission branch (PRISM GenAI Hackathon final: Phase 1, P1 versions, bonus
+  lineage grouping, slides and AI disclosure). Space work is on `deploy-space`; `phase2-versions` and
+  `bonus-evolution` are merged into `main`.
 - **Space hardware:** `code-search-demo` stays on ZeroGPU (user's decision; a free account can't downgrade it
   anyway, HTTP 402). ZeroGPU needs a `@spaces.GPU` function and rejects `+cpu` torch, so the app keeps a
   "GPU (optional)" encode path with CPU as the default, and pins `torch==2.10.0`. Don't create a new Space.
