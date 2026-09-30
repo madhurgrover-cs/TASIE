@@ -1,24 +1,17 @@
 # CLAUDE.md
 
-## What this repo is (and is becoming)
+## What this repo is
 
-Originally **SAST IQ / TASIE**: a FastAPI + vanilla-JS SAST scanner (regex rules → TF-IDF/LogReg
-classifier → developer feedback → retraining). It is being repurposed for Samsung's
-**"Agentic Code Intelligence"** hackathon: *natural-language query → ranked code snippets*.
+Samsung's **"Agentic Code Intelligence"** hackathon submission: *natural-language query → ranked code snippets*.
 
 - **Screening metric:** NDCG@10 and MRR@10 on MTEB task `AppsRetrieval` (CoIR, dataset
   `CoIR-Retrieval/apps`, split `test`, main score `ndcg_at_10`). **CPU only.**
 - **P1:** rebuild indexes quickly across code versions (incremental / diff-based re-indexing).
 - **Bonus:** retrieval across *all* versions of snippets.
 
-Nothing SAST-specific has been deleted yet. See the reuse table below before removing anything.
-
 ## Commands
 
 ```bash
-# API + dashboard (http://localhost:8000/dashboard, docs at /docs)
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
-
 # Retrieval eval (writes appsretrieval_results.json + appsretrieval_results_mteb/<variant>.json,
 # prints a summary table: variant, NDCG@10, MRR@10, time). `python -m retrieval.eval_baseline` also works.
 python retrieval/eval_baseline.py                                        # dense CodeRankEmbed, desc-io queries (default)
@@ -45,17 +38,6 @@ Run Python from the **project root**, not from inside `.venv/.../site-packages/m
 ## Layout
 
 ```
-backend/
-  main.py               FastAPI app; mounts frontend/ at /dashboard
-  database.py           SQLite (sast_learning.db) engine + get_db()
-  models.py             ORM: Feedback, SmartMemory                          [SAST — replace]
-  api/routes.py         /api/scan, /api/feedback, /api/dashboard/metrics,
-                        /api/smart-memory, /api/model/versions, /api/model/retrain
-  ml/model_registry.py  versioned artefacts in models/ + models/registry.json [REUSE]
-  ml/retraining.py      TF-IDF + LogisticRegression on feedback             [SAST — replace]
-  scanner/git_utils.py  git diff → added-line chunks; full-repo file walk   [REUSE]
-  scanner/sast_core.py  SmartMemory → ML → regex 3-stage scan               [SAST — replace]
-frontend/               single-page dashboard (index.html, app.js, styles.css)
 retrieval/
   eval_baseline.py      mteb AbsEncoder wrapper + AppsRetrieval eval (variant grid, summary table)
   bm25_search.py        code tokenizer + rank_bm25 as an mteb SearchProtocol model (no torch/mteb at import)
@@ -75,22 +57,10 @@ space/                  HF Space madhurr382/code-search-demo (Gradio, CPU): app.
                         evolution.py (bonus, branch bonus-evolution): all-versions search grouped into lineages,
                         copied to space/versioned_evolution.py; evolution_report.py = Kaggle verification
 tests/                  pytest (+ unittest), fake embedders + throwaway git repo, no torch: `python -m pytest tests`
-seed_training_data.py   seeds SAST feedback rows                            [SAST — replace]
-requirements.txt        web app only (Render image); requirements-retrieval.txt = CPU torch + mteb + ST
-README.md, KAGGLE.md    submission write-up and Kaggle cells; old SAST README in docs/SAST_README.md
-Dockerfile, render.yaml Render deployment (runs seed + retraining on boot)
+requirements.txt        `-r requirements-retrieval.txt`; requirements-retrieval.txt = CPU torch + mteb + ST
+requirements-dev.txt    pytest + numpy for local tests
+README.md, KAGGLE.md    submission write-up and Kaggle cells
 ```
-
-## Reuse vs. replace
-
-| Component | Status | Notes for retrieval |
-|---|---|---|
-| `backend/scanner/git_utils.py` | **Reuse** | `get_diff_chunks()` gives changed hunks between HEAD and its first parent, which is the basis for diff-based re-indexing (P1). `get_all_files()` + `EXCLUDED_DIRS` give full-index mode. Limits: only diffs HEAD vs `parents[0]` (needs an arbitrary `base..head` variant), chunks are *added-line hunks*, not whole functions (needs function-level chunking for retrieval), and deletions/renames are skipped (index needs tombstones). |
-| `backend/ml/model_registry.py` | **Reuse** | Timestamped versions, `registry.json`, `active_version`, `MODEL_DIR` env override. Currently hard-wired to a joblib `{vectorizer, classifier, threshold}` payload, so it should be generalised to store index versions (embeddings + doc-id map + commit SHA). |
-| `backend/main.py`, `database.py`, `api/routes.py` (`/api/model/versions`), `frontend/*` | **Reuse** | Shell for a query demo: add a `/api/search` route and a search box on the dashboard. |
-| `scanner/sast_core.py` (regex `BASELINE_PATTERNS`, 3-stage scan) | **To be replaced** | SAST-specific. |
-| `ml/retraining.py` (TF-IDF + LogReg) | **To be replaced** | SAST classifier. |
-| `models.py` Feedback / SmartMemory, feedback + smart-memory routes, `seed_training_data.py` | **To be replaced** | SAST feedback loop. |
 
 ## Retrieval eval: `retrieval/eval_baseline.py`
 
@@ -209,15 +179,13 @@ to reproduce the ablation table.
   Windows Smart App Control blocks torch's unsigned DLLs there
   (`WinError 4551 ... Application Control policy has blocked this file`, surfacing as
   `WinError 1114` on `c10.dll`). Local checks are limited to `py_compile` and static review.
-  The FastAPI/SAST parts don't need torch.
 - **Branching:** Phase 1 is merged to `main` (release v1.0). Space work is on `deploy-space`, Phase 2 on
-  `phase2-versions`; never push these to `main`: Render auto-deploys `main` to a friend's account.
+  `phase2-versions`; never push these to `main`.
 - **Space hardware:** `code-search-demo` stays on ZeroGPU (user's decision; a free account can't downgrade it
   anyway, HTTP 402). ZeroGPU needs a `@spaces.GPU` function and rejects `+cpu` torch, so the app keeps a
   "GPU (optional)" encode path with CPU as the default, and pins `torch==2.10.0`. Don't create a new Space.
-- `requirements.txt` has only the web app deps, so the Render image doesn't pull CUDA torch. Retrieval deps live in
-  `requirements-retrieval.txt`, which pins `torch==2.14.0+cpu` from the PyTorch CPU index. On Kaggle don't install
-  that file (it would replace the CUDA torch); `KAGGLE.md` pip-installs the other pins directly.
+- `requirements.txt` only points to `requirements-retrieval.txt`, which pins `torch==2.14.0+cpu` from the PyTorch CPU index. On Kaggle don't install
+  either file (it would replace the CUDA torch); `KAGGLE.md` pip-installs the other pins directly.
 - `pydantic==2.5.2` works with mteb but prints a "protected namespace model_" warning, which is harmless.
 
 ## Fine-tuning: `retrieval/finetune.py`
