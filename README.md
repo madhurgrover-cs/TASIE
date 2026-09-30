@@ -1,5 +1,37 @@
 # Agentic Code Intelligence: natural-language → code retrieval
 
+**Team Toothpaste Eaters** · Rajdeep Kulkarni · Madhur Grover · Ayush Bidwai · SRM Institute of Science and Technology
+
+| | Link |
+|---|---|
+| Submission release | [PRISM_GENAI_HACKATHON_Y2026](https://github.com/madhurgrover-cs/TASIE/releases/tag/PRISM_GENAI_HACKATHON_Y2026) |
+| Live demo (CPU) | [huggingface.co/spaces/madhurr382/code-search-demo](https://huggingface.co/spaces/madhurr382/code-search-demo) |
+| Presentation | [SRMIST_ToothpasteEaters_Submission.pptx](SRMIST_ToothpasteEaters_Submission.pptx) |
+| Demo video | [Google Drive](https://drive.google.com/drive/folders/1SwFD5EhbK2stWclYkAy1kMGQzIAE8t-G) |
+| Model | [madhurr382/coderankembed-apps-ft](https://huggingface.co/madhurr382/coderankembed-apps-ft) |
+| Indexes | [apps-corpus-index](https://huggingface.co/datasets/madhurr382/apps-corpus-index) · [repo-versions-index](https://huggingface.co/datasets/madhurr382/repo-versions-index) |
+| AI disclosure | [LangAI3_0_AI_Disclosure_ToothpasteEaters.docx](LangAI3_0_AI_Disclosure_ToothpasteEaters.docx) |
+
+> **What to review:** `retrieval/` (P0 model + P1 versioned index), `space/` (demo), `tests/`.
+
+### Setup (no Docker needed)
+Everything runs with plain Python on CPU:
+```bash
+pip install -r requirements-retrieval.txt
+python retrieval/submission.py        # reproduces appsretrieval_results.json
+python -m pytest tests                # runs without torch
+```
+
+### Results at a glance
+
+| | Result |
+|---|---|
+| P0: AppsRetrieval NDCG@10 (CPU) | **0.4720** (base CodeRankEmbed 0.2368, about 2×) |
+| P0: query latency (CPU) | ~28 ms (27 ms encode + 0.4 ms search over 8,765 snippets) |
+| P1: rebuild after a small release | **45× faster** (6 of 773 chunks re-embedded) |
+| P1: 4 versions, 2013–2024 | 28% less embedding work; same query finds the moved function at every version |
+
+
 Submission for Samsung's **Agentic Code Intelligence** hackathon: given a natural-language
 query, rank the code snippets that answer it. **P0** is the screening benchmark (MTEB
 `AppsRetrieval`, CPU); **P1** is retrieval across versions of a codebase, with fast
@@ -209,10 +241,5 @@ retrieval/
 space/                       Hugging Face Space (Gradio): APPS + versioned repo search, see DEPLOY_SPACE.md
 tests/                       pytest, no torch needed
 requirements-retrieval.txt   retrieval deps (CPU torch)
-requirements.txt             web app deps only (Render image)
-backend/, frontend/          FastAPI + dashboard shell from the original SAST IQ project
+requirements.txt             same as requirements-retrieval.txt (installs the retrieval project)
 ```
-
-The repository started as **SAST IQ**, a self-learning SAST scanner. Its README is kept at
-[docs/SAST_README.md](docs/SAST_README.md), and the web app still runs with
-`pip install -r requirements.txt && python -m uvicorn backend.main:app`.

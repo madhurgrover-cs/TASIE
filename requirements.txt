@@ -1,10 +1,1 @@
-# Web app (FastAPI dashboard, SAST demo). This is what the Render Docker image installs,
-# so keep torch / mteb out of it: retrieval deps are in requirements-retrieval.txt.
-fastapi==0.104.1
-uvicorn==0.24.0.post1
-sqlalchemy==2.0.23
-scikit-learn==1.3.2
-gitpython==3.1.40
-pydantic==2.5.2
-python-multipart==0.0.6
-joblib==1.3.2
+-r requirements-retrieval.txt
